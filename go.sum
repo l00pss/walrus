@@ -2,3 +2,5 @@ github.com/l00pss/helpme/goerr v1.0.1 h1:AjiyOloqtlExIypbfQS3yFql4zMrjir7e6sJYQC
 github.com/l00pss/helpme/goerr v1.0.1/go.mod h1:bDo6D4z6TYWakaP1gNpnn0aKRUCvpcR/6TM8KMFDK6Q=
 github.com/l00pss/helpme/result v1.0.1 h1:jqzYYMXpSw1SXhsjQps3aVnoVO/omxscwuQRRUa7Yvc=
 github.com/l00pss/helpme/result v1.0.1/go.mod h1:nIM0dE6A3ydc0xsbSdk6/TvsjCgpuzErU0orPgYxjYU=
+github.com/l00pss/littlecache v1.0.0 h1:qq+T1QR64JQqRALf3URJpytKVGggOJRr8pdxvbtl/MU=
+github.com/l00pss/littlecache v1.0.0/go.mod h1:NHzLYgnS9BsYoNBx90u9X7MsrV5E/tfuXSUKWN/lhJk=
