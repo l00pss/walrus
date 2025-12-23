@@ -77,10 +77,19 @@ type Entry struct {
 }
 
 type Segment struct {
-	id         uint64
-	startIndex uint64
-	endIndex   uint64
-	size       int64
-	filePath   string
-	file       *os.File
+	path     string
+	index    uint64
+	filePath string
+	file     *os.File
 }
+
+type Permission os.FileMode
+
+const (
+	// DefaultFilePermission is the default file permission for WAL files.
+	DefaultFilePermission Permission = 0644
+	// DirectoryPermission is the permission for WAL directories.
+	DirectoryPermission = 0750
+	// Segment
+	FilePermission = 0640
+)

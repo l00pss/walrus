@@ -10,6 +10,7 @@ import (
 )
 
 type WAL struct {
+	config         Config
 	mu             sync.RWMutex
 	state          State
 	status         Status
@@ -19,7 +20,7 @@ type WAL struct {
 	segments       []*Segment
 	currentSegment *Segment
 	cache          *littlecache.LittleCache
-	config         Config
+	batch          Batch
 }
 
 func NewWAL(dir string, config Config) result.Result[*WAL] {
@@ -39,6 +40,8 @@ func NewWAL(dir string, config Config) result.Result[*WAL] {
 	if err != nil {
 		return result.Err[*WAL](err)
 	}
+	cache.Resize(config.cachedSegments * 1024)
+	MkDirIfNotExist(dir)
 
 	w := &WAL{
 		mu:     sync.RWMutex{},
@@ -51,4 +54,12 @@ func NewWAL(dir string, config Config) result.Result[*WAL] {
 	}
 
 	return result.Ok(w)
+}
+
+func MkDirIfNotExist(dir string) result.Result[struct{}] {
+	err := os.MkdirAll(dir, DirectoryPermission)
+	if err != nil {
+		return result.Err[struct{}](err)
+	}
+	return result.Ok(struct{}{})
 }
