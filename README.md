@@ -1,5 +1,16 @@
 # Walrus - Write-Ahead Log (WAL) Implementation
 
+<br>
+<div align="center">
+  <img src="logo.png" alt="LittleCache Logo" width="800"/>
+  <br><br>
+  <a href="https://golang.org/"><img src="https://img.shields.io/badge/go-1.25+-00ADD8?style=flat&logo=go&logoColor=white" alt="Go Version"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat" alt="License"></a>
+  <a href="https://goreportcard.com/report/github.com/l00pss/littlecache"><img src="https://goreportcard.com/badge/github.com/l00pss/littlecache" alt="Go Report Card"></a>
+  <a href="https://github.com/l00pss/littlecache/stargazers"><img src="https://img.shields.io/github/stars/l00pss/littlecache?style=flat&logo=github" alt="GitHub Stars"></a>
+</div>
+
+
 Walrus is a high-performance and reliable Write-Ahead Log (WAL) implementation written in Go. It's designed for data integrity and reliable recovery operations.
 
 ## Features
