@@ -266,6 +266,7 @@ func TestSegmentRotation(t *testing.T) {
 
 	config := testConfig()
 	config.segmentSize = 512
+	config.maxSegments = 100
 
 	wal := NewWAL(dir, config).Unwrap()
 	defer wal.Close()

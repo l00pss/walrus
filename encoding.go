@@ -87,9 +87,7 @@ func (e BinaryEncoder) Decode(data []byte) result.Result[Entry] {
 	return result.Ok(entry)
 }
 
-type JSONEncoder struct {
-	Encoder
-}
+type JSONEncoder struct{}
 
 type jsonEntry struct {
 	Index     uint64 `json:"index"`
@@ -99,7 +97,7 @@ type jsonEntry struct {
 	Timestamp int64  `json:"timestamp"`
 }
 
-func (e *JSONEncoder) encode(entry Entry) result.Result[[]byte] {
+func (e JSONEncoder) Encode(entry Entry) result.Result[[]byte] {
 	je := jsonEntry{
 		Index:     entry.Index,
 		Term:      entry.Term,
@@ -126,7 +124,7 @@ func (e *JSONEncoder) encode(entry Entry) result.Result[[]byte] {
 	}
 }
 
-func (e *JSONEncoder) decode(data []byte) result.Result[Entry] {
+func (e JSONEncoder) Decode(data []byte) result.Result[Entry] {
 	var je jsonEntry
 	if err := json.Unmarshal(data, &je); err != nil {
 		return result.Err[Entry](err)
