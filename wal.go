@@ -106,10 +106,16 @@ func (w *WAL) Append(entry Entry) result.Result[uint64] {
 	}
 	data := seralizedEntryResult.Unwrap()
 
+	// Get current offset before writing
+	currentSize, _ := w.currentSegment.Size()
+
 	_, err = w.currentSegment.Write(data)
 	if err != nil {
 		return result.Err[uint64](err)
 	}
+
+	// Track entry offset for index-based lookup
+	w.currentSegment.TrackEntry(entry.Index, currentSize)
 
 	if w.config.syncAfterWrite {
 		if err := w.currentSegment.Sync(); err != nil {
@@ -178,4 +184,98 @@ func (w *WAL) cleanupOldSegments() {
 		os.Remove(oldest.filePath)
 		w.segments = w.segments[1:]
 	}
+}
+
+func (w *WAL) Get(index uint64) result.Result[Entry] {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+
+	if w.state == Closed {
+		return result.Err[Entry](ErrWALClosed)
+	}
+
+	if index < w.cusror.FirstIndex || index > w.cusror.LastIndex {
+		return result.Err[Entry](ErrIndexOutOfRange)
+	}
+
+	segment := w.findSegmentByIndex(index)
+	if segment == nil {
+		return result.Err[Entry](ErrSegmentNotFound)
+	}
+
+	data, err := segment.GetEntryByIndex(index)
+	if err != nil {
+		return result.Err[Entry](err)
+	}
+
+	entryResult := w.encoder.Decode(data)
+	if entryResult.IsErr() {
+		return result.Err[Entry](entryResult.UnwrapErr())
+	}
+
+	return result.Ok(entryResult.Unwrap())
+}
+
+func (w *WAL) GetRange(start, end uint64) result.Result[[]Entry] {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+
+	if w.state == Closed {
+		return result.Err[[]Entry](ErrWALClosed)
+	}
+
+	if start > end {
+		return result.Err[[]Entry](ErrIndexOutOfRange)
+	}
+
+	if start < w.cusror.FirstIndex {
+		start = w.cusror.FirstIndex
+	}
+	if end > w.cusror.LastIndex {
+		end = w.cusror.LastIndex
+	}
+
+	entries := make([]Entry, 0, end-start+1)
+
+	for i := start; i <= end; i++ {
+		segment := w.findSegmentByIndex(i)
+		if segment == nil {
+			continue
+		}
+
+		data, err := segment.GetEntryByIndex(i)
+		if err != nil {
+			return result.Err[[]Entry](err)
+		}
+
+		entryResult := w.encoder.Decode(data)
+		if entryResult.IsErr() {
+			return result.Err[[]Entry](entryResult.UnwrapErr())
+		}
+
+		entries = append(entries, entryResult.Unwrap())
+	}
+
+	return result.Ok(entries)
+}
+
+func (w *WAL) findSegmentByIndex(index uint64) *Segment {
+	for _, seg := range w.segments {
+		if seg.ContainsIndex(index) {
+			return seg
+		}
+	}
+	return nil
+}
+
+func (w *WAL) GetFirstIndex() uint64 {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return w.cusror.FirstIndex
+}
+
+func (w *WAL) GetLastIndex() uint64 {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return w.cusror.LastIndex
 }

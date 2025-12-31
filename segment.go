@@ -14,7 +14,7 @@ import (
 const (
 	SegmentFileExtension = ".wal"
 	SegmentFilePrefix    = "segment_"
-	EntryLengthSize      = 4 // 4 bytes for entry length prefix
+	EntryLengthSize      = 4 // 4 bytes
 )
 
 type Segment struct {
@@ -126,10 +126,13 @@ func createSegment(dir string, index uint64) (*Segment, error) {
 	}
 
 	return &Segment{
-		path:     dir,
-		index:    index,
-		filePath: filePath,
-		file:     file,
+		path:         dir,
+		index:        index,
+		filePath:     filePath,
+		file:         file,
+		firstEntry:   0,
+		lastEntry:    0,
+		entryOffsets: make([]int64, 0),
 	}, nil
 }
 
@@ -146,10 +149,13 @@ func openSegment(filePath string) (*Segment, error) {
 	}
 
 	return &Segment{
-		path:     filepath.Dir(filePath),
-		index:    index,
-		filePath: filePath,
-		file:     file,
+		path:         filepath.Dir(filePath),
+		index:        index,
+		filePath:     filePath,
+		file:         file,
+		firstEntry:   0,
+		lastEntry:    0,
+		entryOffsets: make([]int64, 0),
 	}, nil
 }
 
@@ -181,4 +187,31 @@ func loadSegments(dir string) ([]*Segment, error) {
 	}
 
 	return segments, nil
+}
+
+func (s *Segment) TrackEntry(entryIndex uint64, offset int64) {
+	if s.firstEntry == 0 {
+		s.firstEntry = entryIndex
+	}
+	s.lastEntry = entryIndex
+	s.entryOffsets = append(s.entryOffsets, offset)
+}
+
+func (s *Segment) ContainsIndex(entryIndex uint64) bool {
+	return s.firstEntry > 0 && entryIndex >= s.firstEntry && entryIndex <= s.lastEntry
+}
+
+func (s *Segment) GetEntryByIndex(entryIndex uint64) ([]byte, error) {
+	if !s.ContainsIndex(entryIndex) {
+		return nil, ErrIndexOutOfRange
+	}
+
+	localIndex := entryIndex - s.firstEntry
+	if localIndex >= uint64(len(s.entryOffsets)) {
+		return nil, ErrIndexOutOfRange
+	}
+
+	offset := s.entryOffsets[localIndex]
+	data, _, err := s.ReadAt(offset)
+	return data, err
 }
