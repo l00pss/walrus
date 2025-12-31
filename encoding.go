@@ -19,11 +19,9 @@ type Encoder interface {
 	Decode(data []byte) result.Result[Entry]
 }
 
-type BinaryEncoder struct {
-	Encoder
-}
+type BinaryEncoder struct{}
 
-func (e *BinaryEncoder) encode(entry Entry) result.Result[[]byte] {
+func (e BinaryEncoder) Encode(entry Entry) result.Result[[]byte] {
 	buf := new(bytes.Buffer)
 
 	if err := binary.Write(buf, binary.LittleEndian, entry.Index); err != nil {
@@ -50,7 +48,7 @@ func (e *BinaryEncoder) encode(entry Entry) result.Result[[]byte] {
 	return result.Ok(buf.Bytes())
 }
 
-func (e *BinaryEncoder) decode(data []byte) result.Result[Entry] {
+func (e BinaryEncoder) Decode(data []byte) result.Result[Entry] {
 	buf := bytes.NewReader(data)
 	var entry Entry
 
