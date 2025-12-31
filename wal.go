@@ -77,10 +77,105 @@ func MkDirIfNotExist(dir string) result.Result[struct{}] {
 func (w *WAL) Append(entry Entry) result.Result[uint64] {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+
+	if w.state == Closed {
+		return result.Err[uint64](ErrWALClosed)
+	}
+
+	if w.currentSegment == nil {
+		if err := w.ensureSegment(); err != nil {
+			return result.Err[uint64](err)
+		}
+	}
+
+	size, err := w.currentSegment.Size()
+	if err != nil {
+		return result.Err[uint64](err)
+	}
+	if size >= w.config.segmentSize {
+		if err := w.rotateSegment(); err != nil {
+			return result.Err[uint64](err)
+		}
+	}
+
+	entry.Index = w.cusror.LastIndex + 1
+
 	seralizedEntryResult := w.encoder.Encode(entry)
 	if seralizedEntryResult.IsErr() {
 		return result.Err[uint64](seralizedEntryResult.UnwrapErr())
 	}
+	data := seralizedEntryResult.Unwrap()
 
-	return result.Err[uint64](UnknownError)
+	_, err = w.currentSegment.Write(data)
+	if err != nil {
+		return result.Err[uint64](err)
+	}
+
+	if w.config.syncAfterWrite {
+		if err := w.currentSegment.Sync(); err != nil {
+			return result.Err[uint64](err)
+		}
+	}
+
+	w.cusror.LastIndex = entry.Index
+	if w.cusror.FirstIndex == 0 {
+		w.cusror.FirstIndex = entry.Index
+	}
+
+	return result.Ok(entry.Index)
+}
+
+func (w *WAL) ensureSegment() error {
+	if w.currentSegment != nil {
+		return nil
+	}
+
+	segments, err := loadSegments(w.dir)
+	if err != nil {
+		return err
+	}
+
+	if len(segments) > 0 {
+		w.segments = segments
+		w.currentSegment = segments[len(segments)-1]
+		return nil
+	}
+
+	return w.rotateSegment()
+}
+
+func (w *WAL) rotateSegment() error {
+	if w.currentSegment != nil {
+		if err := w.currentSegment.Sync(); err != nil {
+			return err
+		}
+	}
+
+	var newIndex uint64 = 1
+	if len(w.segments) > 0 {
+		newIndex = w.segments[len(w.segments)-1].index + 1
+	}
+
+	segment, err := createSegment(w.dir, newIndex)
+	if err != nil {
+		return err
+	}
+
+	w.segments = append(w.segments, segment)
+	w.currentSegment = segment
+
+	if len(w.segments) > w.config.maxSegments {
+		w.cleanupOldSegments()
+	}
+
+	return nil
+}
+
+func (w *WAL) cleanupOldSegments() {
+	for len(w.segments) > w.config.maxSegments {
+		oldest := w.segments[0]
+		oldest.Close()
+		os.Remove(oldest.filePath)
+		w.segments = w.segments[1:]
+	}
 }

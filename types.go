@@ -71,13 +71,6 @@ type Entry struct {
 	Timestamp time.Time
 }
 
-type Segment struct {
-	path     string
-	index    uint64
-	filePath string
-	file     *os.File
-}
-
 type Permission os.FileMode
 
 const (
