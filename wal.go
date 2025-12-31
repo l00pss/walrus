@@ -1,6 +1,7 @@
 package walrus
 
 import (
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -278,4 +279,142 @@ func (w *WAL) GetLastIndex() uint64 {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 	return w.cusror.LastIndex
+}
+
+func Open(dir string, config Config) result.Result[*WAL] {
+	walResult := NewWAL(dir, config)
+	if walResult.IsErr() {
+		return walResult
+	}
+
+	w := walResult.Unwrap()
+	if err := w.recover(); err != nil {
+		return result.Err[*WAL](err)
+	}
+
+	w.state = Ready
+	return result.Ok(w)
+}
+
+func (w *WAL) recover() error {
+	segments, err := loadSegments(w.dir)
+	if err != nil {
+		return err
+	}
+
+	if len(segments) == 0 {
+		return nil
+	}
+
+	w.segments = segments
+	w.currentSegment = segments[len(segments)-1]
+
+	for _, seg := range segments {
+		if err := w.recoverSegment(seg); err != nil {
+			w.status = Corrupted
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (w *WAL) recoverSegment(seg *Segment) error {
+	var offset int64 = 0
+
+	for {
+		data, nextOffset, err := seg.ReadAt(offset)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return w.handleCorruptedEntry(seg, offset)
+		}
+
+		entryResult := w.encoder.Decode(data)
+		if entryResult.IsErr() {
+			return w.handleCorruptedEntry(seg, offset)
+		}
+
+		entry := entryResult.Unwrap()
+		seg.TrackEntry(entry.Index, offset)
+
+		if w.cusror.FirstIndex == 0 {
+			w.cusror.FirstIndex = entry.Index
+		}
+		w.cusror.LastIndex = entry.Index
+
+		offset = nextOffset
+	}
+
+	return nil
+}
+
+func (w *WAL) handleCorruptedEntry(seg *Segment, offset int64) error {
+	if err := seg.file.Truncate(offset); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (w *WAL) Truncate(index uint64) result.Result[struct{}] {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.state == Closed {
+		return result.Err[struct{}](ErrWALClosed)
+	}
+
+	if index < w.cusror.FirstIndex || index > w.cusror.LastIndex {
+		return result.Err[struct{}](ErrIndexOutOfRange)
+	}
+
+	for i := len(w.segments) - 1; i >= 0; i-- {
+		seg := w.segments[i]
+
+		if seg.firstEntry > index {
+			seg.Close()
+			os.Remove(seg.filePath)
+			w.segments = w.segments[:i]
+			continue
+		}
+
+		if seg.ContainsIndex(index) {
+			localIdx := index - seg.firstEntry
+			if localIdx < uint64(len(seg.entryOffsets)-1) {
+				nextOffset := seg.entryOffsets[localIdx+1]
+				seg.file.Truncate(nextOffset)
+				seg.lastEntry = index
+				seg.entryOffsets = seg.entryOffsets[:localIdx+1]
+			}
+			break
+		}
+	}
+
+	w.cusror.LastIndex = index
+	if len(w.segments) > 0 {
+		w.currentSegment = w.segments[len(w.segments)-1]
+	}
+
+	return result.Ok(struct{}{})
+}
+
+func (w *WAL) Close() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.state == Closed {
+		return nil
+	}
+
+	for _, seg := range w.segments {
+		seg.Sync()
+		seg.Close()
+	}
+
+	w.segments = nil
+	w.currentSegment = nil
+	w.state = Closed
+
+	return nil
 }
