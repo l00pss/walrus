@@ -1,0 +1,16 @@
+package walrus
+
+import "errors"
+
+var (
+	ErrChecksumMismatch  = errors.New("checksum mismatch: data may be corrupted")
+	ErrEmptyData         = errors.New("entry data cannot be empty")
+	ErrInvalidEntry      = errors.New("invalid entry")
+	ErrWALCorrupted      = errors.New("WAL is corrupted")
+	ErrWALClosed         = errors.New("WAL is closed")
+	ErrIndexOutOfRange   = errors.New("index out of range")
+	ErrSegmentNotFound   = errors.New("segment not found")
+	ErrSegmentFull       = errors.New("segment is full")
+	ErrUnsupportedFormat = errors.New("unsupported encode format")
+	UnknownError         = errors.New("Unknown error")
+)

@@ -8,20 +8,15 @@ import (
 type State int
 
 const (
-	// StateInitializing indicates that the WAL is initializing.
 	Initializing State = iota
-	// StateReady indicates that the WAL is ready for operations.
 	Ready
-	// StateClosed indicates that the WAL has been closed.
 	Closed
 )
 
 type Status int
 
 const (
-	// OK indicates that the operation was successful.
 	OK Status = iota
-	// Corrupted indicates that the WAL is corrupted.
 	Corrupted
 )
 
@@ -86,10 +81,7 @@ type Segment struct {
 type Permission os.FileMode
 
 const (
-	// DefaultFilePermission is the default file permission for WAL files.
 	DefaultFilePermission Permission = 0644
-	// DirectoryPermission is the permission for WAL directories.
-	DirectoryPermission = 0750
-	// Segment
-	FilePermission = 0640
+	DirectoryPermission              = 0750
+	FilePermission                   = 0640
 )
