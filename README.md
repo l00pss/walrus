@@ -10,6 +10,11 @@
   <a href="https://github.com/l00pss/littlecache/stargazers"><img src="https://img.shields.io/github/stars/l00pss/littlecache?style=flat&logo=github" alt="GitHub Stars"></a>
 </div>
 
+<br>
+<div align="center">
+  <a href="https://www.buymeacoffee.com/l00pss" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" style="height: 60px !important;width: 217px !important;" ></a>
+</div>
+
 
 Walrus is a high-performance and reliable Write-Ahead Log (WAL) implementation written in Go. It's designed for data integrity and reliable recovery operations.
 
