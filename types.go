@@ -82,6 +82,6 @@ type Permission os.FileMode
 
 const (
 	DefaultFilePermission Permission = 0644
-	DirectoryPermission              = 0750
-	FilePermission                   = 0640
+	DirectoryPermission   Permission = 0750
+	FilePermission        Permission = 0640
 )
