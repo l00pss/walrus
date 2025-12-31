@@ -12,6 +12,7 @@ import (
 type WAL struct {
 	config         Config
 	mu             sync.RWMutex
+	encoder        Encoder
 	state          State
 	status         Status
 	cusror         Cursor
@@ -43,21 +44,30 @@ func NewWAL(dir string, config Config) result.Result[*WAL] {
 	cache.Resize(config.cachedSegments * 1024)
 	MkDirIfNotExist(dir)
 
+	var encoder Encoder
+	switch config.format {
+	case BINARY:
+		encoder = BinaryEncoder{}
+	case JSON:
+		encoder = JSONEncoder{}
+	}
+
 	w := &WAL{
-		mu:     sync.RWMutex{},
-		state:  Initializing,
-		status: OK,
-		cusror: StartCursor(),
-		dir:    dir,
-		config: configResult.Unwrap(),
-		cache:  &cache,
+		mu:      sync.RWMutex{},
+		encoder: encoder,
+		state:   Initializing,
+		status:  OK,
+		cusror:  StartCursor(),
+		dir:     dir,
+		config:  configResult.Unwrap(),
+		cache:   &cache,
 	}
 
 	return result.Ok(w)
 }
 
 func MkDirIfNotExist(dir string) result.Result[struct{}] {
-	err := os.MkdirAll(dir, DirectoryPermission)
+	err := os.MkdirAll(dir, os.FileMode(DirectoryPermission))
 	if err != nil {
 		return result.Err[struct{}](err)
 	}
@@ -67,48 +77,10 @@ func MkDirIfNotExist(dir string) result.Result[struct{}] {
 func (w *WAL) Append(entry Entry) result.Result[uint64] {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	seralizedEntryResult := w.encode(entry)
+	seralizedEntryResult := w.encoder.Encode(entry)
 	if seralizedEntryResult.IsErr() {
 		return result.Err[uint64](seralizedEntryResult.UnwrapErr())
 	}
 
 	return result.Err[uint64](UnknownError)
-}
-
-func (w *WAL) encode(entry Entry) result.Result[[]byte] {
-	var data []byte
-	var err error
-
-	switch w.config.format {
-	case BINARY:
-		data, err = encodeBinary(entry)
-	case JSON:
-		data, err = encodeJSON(entry)
-	default:
-		return result.Err[[]byte](ErrUnsupportedFormat)
-	}
-
-	if err != nil {
-		return result.Err[[]byte](err)
-	}
-	return result.Ok(data)
-}
-
-func (w *WAL) decode(data []byte) result.Result[Entry] {
-	var entry Entry
-	var err error
-
-	switch w.config.format {
-	case BINARY:
-		entry, err = decodeBinary(data)
-	case JSON:
-		entry, err = decodeJSON(data)
-	default:
-		return result.Err[Entry](ErrUnsupportedFormat)
-	}
-
-	if err != nil {
-		return result.Err[Entry](err)
-	}
-	return result.Ok(entry)
 }

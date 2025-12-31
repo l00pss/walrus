@@ -6,76 +6,91 @@ import (
 	"encoding/json"
 	"hash/crc32"
 	"time"
+
+	"github.com/l00pss/helpme/result"
 )
 
 const (
 	EntryHeaderSize = 8 + 8 + 4 + 8 + 4 // Index + Term + DataLen + Timestamp + Checksum
 )
 
-func encodeBinary(entry Entry) ([]byte, error) {
+type Encoder interface {
+	Encode(entry Entry) result.Result[[]byte]
+	Decode(data []byte) result.Result[Entry]
+}
+
+type BinaryEncoder struct {
+	Encoder
+}
+
+func (e *BinaryEncoder) encode(entry Entry) result.Result[[]byte] {
 	buf := new(bytes.Buffer)
 
 	if err := binary.Write(buf, binary.LittleEndian, entry.Index); err != nil {
-		return nil, err
+		return result.Err[[]byte](err)
 	}
 	if err := binary.Write(buf, binary.LittleEndian, entry.Term); err != nil {
-		return nil, err
+		return result.Err[[]byte](err)
 	}
 	if err := binary.Write(buf, binary.LittleEndian, entry.Timestamp.UnixNano()); err != nil {
-		return nil, err
+		return result.Err[[]byte](err)
 	}
 	if err := binary.Write(buf, binary.LittleEndian, uint32(len(entry.Data))); err != nil {
-		return nil, err
+		return result.Err[[]byte](err)
 	}
 	if _, err := buf.Write(entry.Data); err != nil {
-		return nil, err
+		return result.Err[[]byte](err)
 	}
 
 	checksum := crc32.ChecksumIEEE(buf.Bytes())
 	if err := binary.Write(buf, binary.LittleEndian, checksum); err != nil {
-		return nil, err
+		return result.Err[[]byte](err)
 	}
 
-	return buf.Bytes(), nil
+	return result.Ok(buf.Bytes())
 }
 
-func decodeBinary(data []byte) (Entry, error) {
+func (e *BinaryEncoder) decode(data []byte) result.Result[Entry] {
 	buf := bytes.NewReader(data)
 	var entry Entry
 
 	if err := binary.Read(buf, binary.LittleEndian, &entry.Index); err != nil {
-		return Entry{}, err
+		return result.Err[Entry](err)
 	}
 	if err := binary.Read(buf, binary.LittleEndian, &entry.Term); err != nil {
-		return Entry{}, err
+		return result.Err[Entry](err)
 	}
 	var timestamp int64
 	if err := binary.Read(buf, binary.LittleEndian, &timestamp); err != nil {
-		return Entry{}, err
+		return result.Err[Entry](err)
 	}
 	entry.Timestamp = time.Unix(0, timestamp)
 
 	var dataLen uint32
 	if err := binary.Read(buf, binary.LittleEndian, &dataLen); err != nil {
-		return Entry{}, err
+		return result.Err[Entry](err)
 	}
 
 	entry.Data = make([]byte, dataLen)
 	if _, err := buf.Read(entry.Data); err != nil {
-		return Entry{}, err
+		return result.Err[Entry](err)
 	}
 
 	if err := binary.Read(buf, binary.LittleEndian, &entry.Checksum); err != nil {
-		return Entry{}, err
+		return result.Err[Entry](err)
 	}
 
 	dataWithoutChecksum := data[:len(data)-4]
 	expectedChecksum := crc32.ChecksumIEEE(dataWithoutChecksum)
 	if entry.Checksum != expectedChecksum {
-		return Entry{}, ErrChecksumMismatch
+		return result.Err[Entry](ErrChecksumMismatch)
 	}
 
-	return entry, nil
+	return result.Ok(entry)
+}
+
+type JSONEncoder struct {
+	Encoder
 }
 
 type jsonEntry struct {
@@ -86,7 +101,7 @@ type jsonEntry struct {
 	Timestamp int64  `json:"timestamp"`
 }
 
-func encodeJSON(entry Entry) ([]byte, error) {
+func (e *JSONEncoder) encode(entry Entry) result.Result[[]byte] {
 	je := jsonEntry{
 		Index:     entry.Index,
 		Term:      entry.Term,
@@ -101,17 +116,22 @@ func encodeJSON(entry Entry) ([]byte, error) {
 		Timestamp: je.Timestamp,
 	})
 	if err != nil {
-		return nil, err
+		return result.Err[[]byte](err)
 	}
 	je.Checksum = crc32.ChecksumIEEE(dataForChecksum)
 
-	return json.Marshal(je)
+	res, err := json.Marshal(je)
+	if err != nil {
+		return result.Err[[]byte](err)
+	} else {
+		return result.Ok(res)
+	}
 }
 
-func decodeJSON(data []byte) (Entry, error) {
+func (e *JSONEncoder) decode(data []byte) result.Result[Entry] {
 	var je jsonEntry
 	if err := json.Unmarshal(data, &je); err != nil {
-		return Entry{}, err
+		return result.Err[Entry](err)
 	}
 
 	checksumData, err := json.Marshal(jsonEntry{
@@ -121,18 +141,18 @@ func decodeJSON(data []byte) (Entry, error) {
 		Timestamp: je.Timestamp,
 	})
 	if err != nil {
-		return Entry{}, err
+		return result.Err[Entry](err)
 	}
 	expectedChecksum := crc32.ChecksumIEEE(checksumData)
 	if je.Checksum != expectedChecksum {
-		return Entry{}, ErrChecksumMismatch
+		return result.Err[Entry](ErrChecksumMismatch)
 	}
 
-	return Entry{
+	return result.Ok(Entry{
 		Index:     je.Index,
 		Term:      je.Term,
 		Data:      je.Data,
 		Checksum:  je.Checksum,
 		Timestamp: time.Unix(0, je.Timestamp),
-	}, nil
+	})
 }
