@@ -1,10 +1,13 @@
 package walrus
 
 import (
+	"crypto/rand"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/l00pss/helpme/result"
 	"github.com/l00pss/littlecache"
@@ -23,6 +26,8 @@ type WAL struct {
 	currentSegment *Segment
 	cache          *littlecache.LittleCache
 	batch          Batch
+	transactions   map[TransactionID]*Transaction
+	transactionsMu sync.RWMutex
 }
 
 func NewWAL(dir string, config Config) result.Result[*WAL] {
@@ -54,14 +59,16 @@ func NewWAL(dir string, config Config) result.Result[*WAL] {
 	}
 
 	w := &WAL{
-		mu:      sync.RWMutex{},
-		encoder: encoder,
-		state:   Initializing,
-		status:  OK,
-		cusror:  StartCursor(),
-		dir:     dir,
-		config:  configResult.Unwrap(),
-		cache:   &cache,
+		mu:             sync.RWMutex{},
+		encoder:        encoder,
+		state:          Initializing,
+		status:         OK,
+		cusror:         StartCursor(),
+		dir:            dir,
+		config:         configResult.Unwrap(),
+		cache:          &cache,
+		transactions:   make(map[TransactionID]*Transaction),
+		transactionsMu: sync.RWMutex{},
 	}
 
 	return result.Ok(w)
@@ -107,15 +114,12 @@ func (w *WAL) Append(entry Entry) result.Result[uint64] {
 	}
 	data := seralizedEntryResult.Unwrap()
 
-	// Get current offset before writing
 	currentSize, _ := w.currentSegment.Size()
-
 	_, err = w.currentSegment.Write(data)
 	if err != nil {
 		return result.Err[uint64](err)
 	}
 
-	// Track entry offset for index-based lookup
 	w.currentSegment.TrackEntry(entry.Index, currentSize)
 
 	if w.config.syncAfterWrite {
@@ -130,6 +134,236 @@ func (w *WAL) Append(entry Entry) result.Result[uint64] {
 	}
 
 	return result.Ok(entry.Index)
+}
+
+func (w *WAL) WriteBatch(entries []Entry) result.Result[[]uint64] {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.state == Closed {
+		return result.Err[[]uint64](ErrWALClosed)
+	}
+
+	if len(entries) == 0 {
+		return result.Ok([]uint64{})
+	}
+
+	if w.currentSegment == nil {
+		if err := w.ensureSegment(); err != nil {
+			return result.Err[[]uint64](err)
+		}
+	}
+
+	indices := make([]uint64, len(entries))
+	totalSize := 0
+
+	for i := range entries {
+		indices[i] = w.cusror.LastIndex + uint64(i) + 1
+		entries[i].Index = indices[i]
+		if entries[i].Timestamp.IsZero() {
+			entries[i].Timestamp = time.Now()
+		}
+
+		seralizedEntryResult := w.encoder.Encode(entries[i])
+		if seralizedEntryResult.IsErr() {
+			return result.Err[[]uint64](seralizedEntryResult.UnwrapErr())
+		}
+		totalSize += len(seralizedEntryResult.Unwrap())
+	}
+
+	currentSize, err := w.currentSegment.Size()
+	if err != nil {
+		return result.Err[[]uint64](err)
+	}
+	if currentSize+int64(totalSize) >= w.config.segmentSize {
+		if err := w.rotateSegment(); err != nil {
+			return result.Err[[]uint64](err)
+		}
+	}
+
+	startOffset, _ := w.currentSegment.Size()
+	for _, entry := range entries {
+		seralizedEntryResult := w.encoder.Encode(entry)
+		data := seralizedEntryResult.Unwrap()
+
+		currentOffset, _ := w.currentSegment.Size()
+		_, err := w.currentSegment.Write(data)
+		if err != nil {
+			w.currentSegment.file.Truncate(startOffset)
+			return result.Err[[]uint64](err)
+		}
+
+		w.currentSegment.TrackEntry(entry.Index, currentOffset)
+	}
+
+	if w.config.syncAfterWrite {
+		if err := w.currentSegment.Sync(); err != nil {
+			w.currentSegment.file.Truncate(startOffset)
+			return result.Err[[]uint64](err)
+		}
+	}
+	w.cusror.LastIndex = indices[len(indices)-1]
+	if w.cusror.FirstIndex == 0 {
+		w.cusror.FirstIndex = indices[0]
+	}
+
+	return result.Ok(indices)
+}
+
+func generateTransactionID() TransactionID {
+	b := make([]byte, 16)
+	rand.Read(b)
+	return TransactionID(fmt.Sprintf("tx_%x", b))
+}
+
+func (w *WAL) BeginTransaction(timeout time.Duration) result.Result[TransactionID] {
+	w.transactionsMu.Lock()
+	defer w.transactionsMu.Unlock()
+
+	if w.state == Closed {
+		return result.Err[TransactionID](ErrWALClosed)
+	}
+
+	if timeout == 0 {
+		timeout = w.config.transactionTimeout
+	}
+
+	txID := generateTransactionID()
+	tx := &Transaction{
+		ID:        txID,
+		State:     TransactionPending,
+		Entries:   make([]Entry, 0),
+		StartTime: time.Now(),
+		Timeout:   timeout,
+		Batch:     Batch{},
+	}
+
+	w.transactions[txID] = tx
+	return result.Ok(txID)
+}
+
+func (w *WAL) AddToTransaction(txID TransactionID, entry Entry) result.Result[struct{}] {
+	w.transactionsMu.Lock()
+	defer w.transactionsMu.Unlock()
+
+	tx, exists := w.transactions[txID]
+	if !exists {
+		return result.Err[struct{}](ErrTransactionNotFound)
+	}
+
+	if tx.State != TransactionPending {
+		return result.Err[struct{}](ErrTransactionNotPending)
+	}
+
+	if tx.IsExpired() {
+		tx.State = TransactionAborted
+		return result.Err[struct{}](ErrTransactionExpired)
+	}
+
+	if len(tx.Entries) >= w.config.maxTransactionEntries {
+		return result.Err[struct{}](ErrTransactionTooLarge)
+	}
+
+	entry.TransactionID = txID
+	tx.Entries = append(tx.Entries, entry)
+	return result.Ok(struct{}{})
+}
+
+func (w *WAL) CommitTransaction(txID TransactionID) result.Result[[]uint64] {
+	w.transactionsMu.Lock()
+	tx, exists := w.transactions[txID]
+	if !exists {
+		w.transactionsMu.Unlock()
+		return result.Err[[]uint64](ErrTransactionNotFound)
+	}
+
+	if tx.State != TransactionPending {
+		w.transactionsMu.Unlock()
+		return result.Err[[]uint64](ErrTransactionNotPending)
+	}
+
+	if tx.IsExpired() {
+		tx.State = TransactionAborted
+		w.transactionsMu.Unlock()
+		return result.Err[[]uint64](ErrTransactionExpired)
+	}
+
+	tx.State = TransactionCommitted
+	entries := make([]Entry, len(tx.Entries))
+	copy(entries, tx.Entries)
+	w.transactionsMu.Unlock()
+
+	result := w.WriteBatch(entries)
+
+	w.transactionsMu.Lock()
+	delete(w.transactions, txID)
+	w.transactionsMu.Unlock()
+
+	return result
+}
+
+func (w *WAL) RollbackTransaction(txID TransactionID) result.Result[struct{}] {
+	w.transactionsMu.Lock()
+	defer w.transactionsMu.Unlock()
+
+	tx, exists := w.transactions[txID]
+	if !exists {
+		return result.Err[struct{}](ErrTransactionNotFound)
+	}
+
+	if tx.State != TransactionPending {
+		return result.Err[struct{}](ErrTransactionNotPending)
+	}
+
+	tx.State = TransactionAborted
+	delete(w.transactions, txID)
+	return result.Ok(struct{}{})
+}
+
+func (w *WAL) GetTransactionState(txID TransactionID) result.Result[TransactionState] {
+	w.transactionsMu.RLock()
+	defer w.transactionsMu.RUnlock()
+
+	tx, exists := w.transactions[txID]
+	if !exists {
+		return result.Err[TransactionState](ErrTransactionNotFound)
+	}
+
+	if tx.IsExpired() && tx.State == TransactionPending {
+		return result.Ok(TransactionAborted)
+	}
+
+	return result.Ok(tx.State)
+}
+
+func (w *WAL) cleanupUncommittedTransactions() {
+	w.transactionsMu.Lock()
+	defer w.transactionsMu.Unlock()
+
+	for txID := range w.transactions {
+		delete(w.transactions, txID)
+	}
+}
+
+func (w *WAL) CleanupExpiredTransactions() int {
+	w.transactionsMu.Lock()
+	defer w.transactionsMu.Unlock()
+
+	cleaned := 0
+	for txID, tx := range w.transactions {
+		if tx.IsExpired() && tx.State == TransactionPending {
+			tx.State = TransactionAborted
+			delete(w.transactions, txID)
+			cleaned++
+		}
+	}
+	return cleaned
+}
+
+func (w *WAL) GetActiveTransactionCount() int {
+	w.transactionsMu.RLock()
+	defer w.transactionsMu.RUnlock()
+	return len(w.transactions)
 }
 
 func (w *WAL) ensureSegment() error {
@@ -292,6 +526,8 @@ func Open(dir string, config Config) result.Result[*WAL] {
 		return result.Err[*WAL](err)
 	}
 
+	w.cleanupUncommittedTransactions()
+
 	w.state = Ready
 	return result.Ok(w)
 }
@@ -407,6 +643,8 @@ func (w *WAL) Close() error {
 		return nil
 	}
 
+	w.rollbackAllPendingTransactions()
+
 	for _, seg := range w.segments {
 		seg.Sync()
 		seg.Close()
@@ -417,4 +655,30 @@ func (w *WAL) Close() error {
 	w.state = Closed
 
 	return nil
+}
+
+func (w *WAL) rollbackAllPendingTransactions() {
+	w.transactionsMu.Lock()
+	defer w.transactionsMu.Unlock()
+
+	for txID, tx := range w.transactions {
+		if tx.State == TransactionPending {
+			tx.State = TransactionAborted
+		}
+		delete(w.transactions, txID)
+	}
+}
+
+func (w *WAL) StartTransactionCleanup() {
+	go func() {
+		ticker := time.NewTicker(w.config.transactionCleanupInterval)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			if w.state == Closed {
+				return
+			}
+			w.CleanupExpiredTransactions()
+		}
+	}()
 }

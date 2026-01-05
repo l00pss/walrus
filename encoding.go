@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	EntryHeaderSize = 8 + 8 + 4 + 8 + 4 // Index + Term + DataLen + Timestamp + Checksum
+	EntryHeaderSize = 8 + 8 + 4 + 8 + 4 + 4 // Index + Term + DataLen + Timestamp + Checksum + TxIDLen
 )
 
 type Encoder interface {
@@ -37,6 +37,14 @@ func (e BinaryEncoder) Encode(entry Entry) result.Result[[]byte] {
 		return result.Err[[]byte](err)
 	}
 	if _, err := buf.Write(entry.Data); err != nil {
+		return result.Err[[]byte](err)
+	}
+
+	txIDBytes := []byte(string(entry.TransactionID))
+	if err := binary.Write(buf, binary.LittleEndian, uint32(len(txIDBytes))); err != nil {
+		return result.Err[[]byte](err)
+	}
+	if _, err := buf.Write(txIDBytes); err != nil {
 		return result.Err[[]byte](err)
 	}
 
@@ -74,6 +82,19 @@ func (e BinaryEncoder) Decode(data []byte) result.Result[Entry] {
 		return result.Err[Entry](err)
 	}
 
+	var txIDLen uint32
+	if err := binary.Read(buf, binary.LittleEndian, &txIDLen); err != nil {
+		return result.Err[Entry](err)
+	}
+
+	if txIDLen > 0 {
+		txIDBytes := make([]byte, txIDLen)
+		if _, err := buf.Read(txIDBytes); err != nil {
+			return result.Err[Entry](err)
+		}
+		entry.TransactionID = TransactionID(string(txIDBytes))
+	}
+
 	if err := binary.Read(buf, binary.LittleEndian, &entry.Checksum); err != nil {
 		return result.Err[Entry](err)
 	}
@@ -90,26 +111,29 @@ func (e BinaryEncoder) Decode(data []byte) result.Result[Entry] {
 type JSONEncoder struct{}
 
 type jsonEntry struct {
-	Index     uint64 `json:"index"`
-	Term      uint64 `json:"term"`
-	Data      []byte `json:"data"`
-	Checksum  uint32 `json:"checksum"`
-	Timestamp int64  `json:"timestamp"`
+	Index         uint64 `json:"index"`
+	Term          uint64 `json:"term"`
+	Data          []byte `json:"data"`
+	Checksum      uint32 `json:"checksum"`
+	Timestamp     int64  `json:"timestamp"`
+	TransactionID string `json:"transaction_id"`
 }
 
 func (e JSONEncoder) Encode(entry Entry) result.Result[[]byte] {
 	je := jsonEntry{
-		Index:     entry.Index,
-		Term:      entry.Term,
-		Data:      entry.Data,
-		Timestamp: entry.Timestamp.UnixNano(),
+		Index:         entry.Index,
+		Term:          entry.Term,
+		Data:          entry.Data,
+		Timestamp:     entry.Timestamp.UnixNano(),
+		TransactionID: string(entry.TransactionID),
 	}
 
 	dataForChecksum, err := json.Marshal(jsonEntry{
-		Index:     je.Index,
-		Term:      je.Term,
-		Data:      je.Data,
-		Timestamp: je.Timestamp,
+		Index:         je.Index,
+		Term:          je.Term,
+		Data:          je.Data,
+		Timestamp:     je.Timestamp,
+		TransactionID: je.TransactionID,
 	})
 	if err != nil {
 		return result.Err[[]byte](err)
@@ -131,10 +155,11 @@ func (e JSONEncoder) Decode(data []byte) result.Result[Entry] {
 	}
 
 	checksumData, err := json.Marshal(jsonEntry{
-		Index:     je.Index,
-		Term:      je.Term,
-		Data:      je.Data,
-		Timestamp: je.Timestamp,
+		Index:         je.Index,
+		Term:          je.Term,
+		Data:          je.Data,
+		Timestamp:     je.Timestamp,
+		TransactionID: je.TransactionID,
 	})
 	if err != nil {
 		return result.Err[Entry](err)
@@ -145,10 +170,11 @@ func (e JSONEncoder) Decode(data []byte) result.Result[Entry] {
 	}
 
 	return result.Ok(Entry{
-		Index:     je.Index,
-		Term:      je.Term,
-		Data:      je.Data,
-		Checksum:  je.Checksum,
-		Timestamp: time.Unix(0, je.Timestamp),
+		Index:         je.Index,
+		Term:          je.Term,
+		Data:          je.Data,
+		Checksum:      je.Checksum,
+		Timestamp:     time.Unix(0, je.Timestamp),
+		TransactionID: TransactionID(je.TransactionID),
 	})
 }

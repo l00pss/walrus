@@ -23,16 +23,19 @@ func cleanup(dir string) {
 
 func testConfig() Config {
 	return Config{
-		syncAfterWrite: true,
-		dir:            "",
-		segmentSize:    1024 * 1024,
-		cachedSegments: 4,
-		maxSegments:    10,
-		syncInterval:   time.Second,
-		bufferSize:     4096,
-		zeroCopy:       false,
-		format:         BINARY,
-		compression:    false,
+		syncAfterWrite:             true,
+		dir:                        "",
+		segmentSize:                1024 * 1024,
+		cachedSegments:             4,
+		maxSegments:                10,
+		syncInterval:               time.Second,
+		bufferSize:                 4096,
+		zeroCopy:                   false,
+		format:                     BINARY,
+		compression:                false,
+		transactionTimeout:         30 * time.Second,
+		maxTransactionEntries:      1000,
+		transactionCleanupInterval: 5 * time.Minute,
 	}
 }
 
@@ -444,5 +447,343 @@ func BenchmarkGet(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		wal.Get(uint64(i%1000) + 1)
+	}
+}
+
+func TestBeginTransaction(t *testing.T) {
+	dir := tempDir(t)
+	defer cleanup(dir)
+
+	config := testConfig()
+	wal := NewWAL(dir, config).Unwrap()
+	defer wal.Close()
+
+	txID := wal.BeginTransaction(30 * time.Second)
+	if txID.IsErr() {
+		t.Fatalf("BeginTransaction failed: %v", txID.UnwrapErr())
+	}
+
+	state := wal.GetTransactionState(txID.Unwrap())
+	if state.IsErr() {
+		t.Fatalf("GetTransactionState failed: %v", state.UnwrapErr())
+	}
+
+	if state.Unwrap() != TransactionPending {
+		t.Errorf("expected TransactionPending, got %v", state.Unwrap())
+	}
+}
+
+func TestTransactionTimeout(t *testing.T) {
+	dir := tempDir(t)
+	defer cleanup(dir)
+
+	config := testConfig()
+	wal := NewWAL(dir, config).Unwrap()
+	defer wal.Close()
+
+	txID := wal.BeginTransaction(100 * time.Millisecond)
+	if txID.IsErr() {
+		t.Fatalf("BeginTransaction failed: %v", txID.UnwrapErr())
+	}
+
+	time.Sleep(200 * time.Millisecond)
+
+	entry := Entry{
+		Data:      []byte("test data"),
+		Timestamp: time.Now(),
+	}
+
+	err := wal.AddToTransaction(txID.Unwrap(), entry)
+	if err.IsOk() {
+		t.Error("expected error for expired transaction")
+	}
+
+	if err.UnwrapErr() != ErrTransactionExpired {
+		t.Errorf("expected ErrTransactionExpired, got %v", err.UnwrapErr())
+	}
+}
+
+func TestCommitTransaction(t *testing.T) {
+	dir := tempDir(t)
+	defer cleanup(dir)
+
+	config := testConfig()
+	wal := NewWAL(dir, config).Unwrap()
+	defer wal.Close()
+
+	txID := wal.BeginTransaction(30 * time.Second)
+	if txID.IsErr() {
+		t.Fatalf("BeginTransaction failed: %v", txID.UnwrapErr())
+	}
+
+	entries := []Entry{
+		{Data: []byte("entry 1"), Timestamp: time.Now()},
+		{Data: []byte("entry 2"), Timestamp: time.Now()},
+		{Data: []byte("entry 3"), Timestamp: time.Now()},
+	}
+
+	for _, entry := range entries {
+		err := wal.AddToTransaction(txID.Unwrap(), entry)
+		if err.IsErr() {
+			t.Fatalf("AddToTransaction failed: %v", err.UnwrapErr())
+		}
+	}
+
+	indices := wal.CommitTransaction(txID.Unwrap())
+	if indices.IsErr() {
+		t.Fatalf("CommitTransaction failed: %v", indices.UnwrapErr())
+	}
+
+	if len(indices.Unwrap()) != 3 {
+		t.Errorf("expected 3 indices, got %d", len(indices.Unwrap()))
+	}
+
+	for i, idx := range indices.Unwrap() {
+		entry := wal.Get(idx)
+		if entry.IsErr() {
+			t.Fatalf("Get failed for index %d: %v", idx, entry.UnwrapErr())
+		}
+
+		expectedData := entries[i].Data
+		if string(entry.Unwrap().Data) != string(expectedData) {
+			t.Errorf("expected %s, got %s", expectedData, entry.Unwrap().Data)
+		}
+
+		if entry.Unwrap().TransactionID != txID.Unwrap() {
+			t.Errorf("expected transaction ID %s, got %s", txID.Unwrap(), entry.Unwrap().TransactionID)
+		}
+	}
+}
+
+func TestWriteBatch(t *testing.T) {
+	dir := tempDir(t)
+	defer cleanup(dir)
+
+	config := testConfig()
+	wal := NewWAL(dir, config).Unwrap()
+	defer wal.Close()
+
+	entries := []Entry{
+		{Data: []byte("batch entry 1"), Timestamp: time.Now()},
+		{Data: []byte("batch entry 2"), Timestamp: time.Now()},
+		{Data: []byte("batch entry 3"), Timestamp: time.Now()},
+	}
+
+	indices := wal.WriteBatch(entries)
+	if indices.IsErr() {
+		t.Fatalf("WriteBatch failed: %v", indices.UnwrapErr())
+	}
+
+	if len(indices.Unwrap()) != 3 {
+		t.Errorf("expected 3 indices, got %d", len(indices.Unwrap()))
+	}
+
+	for i, idx := range indices.Unwrap() {
+		entry := wal.Get(idx)
+		if entry.IsErr() {
+			t.Fatalf("Get failed for index %d: %v", idx, entry.UnwrapErr())
+		}
+
+		expectedData := entries[i].Data
+		if string(entry.Unwrap().Data) != string(expectedData) {
+			t.Errorf("expected %s, got %s", expectedData, entry.Unwrap().Data)
+		}
+	}
+}
+
+func TestRollbackTransaction(t *testing.T) {
+	dir := tempDir(t)
+	defer cleanup(dir)
+
+	config := testConfig()
+	wal := NewWAL(dir, config).Unwrap()
+	defer wal.Close()
+
+	txID := wal.BeginTransaction(30 * time.Second)
+	if txID.IsErr() {
+		t.Fatalf("BeginTransaction failed: %v", txID.UnwrapErr())
+	}
+
+	entry := Entry{
+		Data:      []byte("test data"),
+		Timestamp: time.Now(),
+	}
+
+	err := wal.AddToTransaction(txID.Unwrap(), entry)
+	if err.IsErr() {
+		t.Fatalf("AddToTransaction failed: %v", err.UnwrapErr())
+	}
+
+	err = wal.RollbackTransaction(txID.Unwrap())
+	if err.IsErr() {
+		t.Fatalf("RollbackTransaction failed: %v", err.UnwrapErr())
+	}
+
+	state := wal.GetTransactionState(txID.Unwrap())
+	if state.IsOk() {
+		t.Error("expected error for rolled back transaction lookup")
+	}
+}
+
+func TestTransactionTooLarge(t *testing.T) {
+	dir := tempDir(t)
+	defer cleanup(dir)
+
+	config := testConfig()
+	config.maxTransactionEntries = 2
+	wal := NewWAL(dir, config).Unwrap()
+	defer wal.Close()
+
+	txID := wal.BeginTransaction(30 * time.Second)
+	if txID.IsErr() {
+		t.Fatalf("BeginTransaction failed: %v", txID.UnwrapErr())
+	}
+
+	entries := []Entry{
+		{Data: []byte("entry 1"), Timestamp: time.Now()},
+		{Data: []byte("entry 2"), Timestamp: time.Now()},
+		{Data: []byte("entry 3"), Timestamp: time.Now()},
+	}
+
+	for i, entry := range entries {
+		err := wal.AddToTransaction(txID.Unwrap(), entry)
+		if i < 2 {
+			if err.IsErr() {
+				t.Fatalf("AddToTransaction failed for entry %d: %v", i, err.UnwrapErr())
+			}
+		} else {
+			if err.IsOk() {
+				t.Error("expected error for transaction too large")
+			}
+			if err.UnwrapErr() != ErrTransactionTooLarge {
+				t.Errorf("expected ErrTransactionTooLarge, got %v", err.UnwrapErr())
+			}
+		}
+	}
+}
+
+func TestCleanupExpiredTransactions(t *testing.T) {
+	dir := tempDir(t)
+	defer cleanup(dir)
+
+	config := testConfig()
+	wal := NewWAL(dir, config).Unwrap()
+	defer wal.Close()
+
+	txID1 := wal.BeginTransaction(50 * time.Millisecond)
+	txID2 := wal.BeginTransaction(200 * time.Millisecond)
+
+	if txID1.IsErr() || txID2.IsErr() {
+		t.Fatal("BeginTransaction failed")
+	}
+
+	if wal.GetActiveTransactionCount() != 2 {
+		t.Errorf("expected 2 active transactions, got %d", wal.GetActiveTransactionCount())
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	cleaned := wal.CleanupExpiredTransactions()
+	if cleaned != 1 {
+		t.Errorf("expected 1 cleaned transaction, got %d", cleaned)
+	}
+
+	if wal.GetActiveTransactionCount() != 1 {
+		t.Errorf("expected 1 active transaction after cleanup, got %d", wal.GetActiveTransactionCount())
+	}
+}
+
+func TestConcurrentTransactions(t *testing.T) {
+	dir := tempDir(t)
+	defer cleanup(dir)
+
+	config := testConfig()
+	wal := NewWAL(dir, config).Unwrap()
+	defer wal.Close()
+
+	const numGoroutines = 10
+	const entriesPerTx = 5
+
+	var wg sync.WaitGroup
+	results := make(chan error, numGoroutines)
+
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+
+			txID := wal.BeginTransaction(30 * time.Second)
+			if txID.IsErr() {
+				results <- txID.UnwrapErr()
+				return
+			}
+
+			for j := 0; j < entriesPerTx; j++ {
+				entry := Entry{
+					Data:      []byte("data"),
+					Timestamp: time.Now(),
+				}
+				err := wal.AddToTransaction(txID.Unwrap(), entry)
+				if err.IsErr() {
+					results <- err.UnwrapErr()
+					return
+				}
+			}
+
+			indices := wal.CommitTransaction(txID.Unwrap())
+			if indices.IsErr() {
+				results <- indices.UnwrapErr()
+				return
+			}
+
+			if len(indices.Unwrap()) != entriesPerTx {
+				results <- ErrInvalidEntry
+				return
+			}
+
+			results <- nil
+		}(i)
+	}
+
+	wg.Wait()
+	close(results)
+
+	for err := range results {
+		if err != nil {
+			t.Errorf("concurrent transaction failed: %v", err)
+		}
+	}
+
+	if wal.GetActiveTransactionCount() != 0 {
+		t.Errorf("expected 0 active transactions after completion, got %d", wal.GetActiveTransactionCount())
+	}
+}
+
+func TestTransactionRecovery(t *testing.T) {
+	dir := tempDir(t)
+	defer cleanup(dir)
+
+	config := testConfig()
+
+	wal1 := NewWAL(dir, config).Unwrap()
+	txID := wal1.BeginTransaction(30 * time.Second)
+	if txID.IsErr() {
+		t.Fatalf("BeginTransaction failed: %v", txID.UnwrapErr())
+	}
+
+	entry := Entry{Data: []byte("test"), Timestamp: time.Now()}
+	wal1.AddToTransaction(txID.Unwrap(), entry)
+
+	if wal1.GetActiveTransactionCount() != 1 {
+		t.Errorf("expected 1 active transaction, got %d", wal1.GetActiveTransactionCount())
+	}
+
+	wal1.Close()
+
+	wal2 := Open(dir, config).Unwrap()
+	defer wal2.Close()
+
+	if wal2.GetActiveTransactionCount() != 0 {
+		t.Errorf("expected 0 active transactions after recovery, got %d", wal2.GetActiveTransactionCount())
 	}
 }

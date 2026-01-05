@@ -14,7 +14,7 @@ import (
 const (
 	SegmentFileExtension = ".wal"
 	SegmentFilePrefix    = "segment_"
-	EntryLengthSize      = 4 // 4 bytes
+	EntryLengthSize      = 4
 )
 
 type Segment struct {
@@ -32,7 +32,6 @@ func (s *Segment) Write(data []byte) (int, error) {
 		return 0, ErrSegmentNotFound
 	}
 
-	// Write entry length prefix (4 bytes)
 	lengthBuf := make([]byte, EntryLengthSize)
 	binary.LittleEndian.PutUint32(lengthBuf, uint32(len(data)))
 

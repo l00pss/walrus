@@ -64,11 +64,43 @@ func (b *Batch) Write(index uint64, data []byte) {
 }
 
 type Entry struct {
-	Index     uint64 // Monotonically increasing index
-	Term      uint64 // For consensus algorithms like Raft
-	Data      []byte
-	Checksum  uint32 // CRC32 or similar
-	Timestamp time.Time
+	Index         uint64
+	Term          uint64
+	Data          []byte
+	Checksum      uint32
+	Timestamp     time.Time
+	TransactionID TransactionID
+}
+
+type TransactionID string
+
+type TransactionState int
+
+const (
+	TransactionPending TransactionState = iota
+	TransactionCommitted
+	TransactionAborted
+)
+
+type Transaction struct {
+	ID        TransactionID
+	State     TransactionState
+	Entries   []Entry
+	StartTime time.Time
+	Timeout   time.Duration
+	Batch     Batch
+}
+
+func (t *Transaction) IsExpired() bool {
+	if t.Timeout == 0 {
+		return false
+	}
+	return time.Since(t.StartTime) > t.Timeout
+}
+
+func (t *Transaction) Reset() {
+	t.Entries = t.Entries[:0]
+	t.Batch.Reset()
 }
 
 type Permission os.FileMode
