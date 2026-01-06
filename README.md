@@ -27,6 +27,8 @@ Walrus is a high-performance and reliable Write-Ahead Log (WAL) implementation w
 - **Thread-Safe**: Safe for concurrent access
 - **Transactions**: ACID transaction support with timeout and rollback capabilities
 - **Batch Operations**: Efficient batch writing for high throughput
+- **Write Buffering**: Configurable I/O buffering for improved write performance
+- **Zero Copy**: Memory-mapped files for high-performance read operations
 
 ## Installation
 
@@ -174,6 +176,8 @@ The segmented architecture provides:
 - **Reduced Fragmentation**: Smaller files reduce file system fragmentation
 - **Better Cache Locality**: Operating system caches work more effectively with smaller files
 - **Scalable Storage**: No single-file size limitations, enabling virtually unlimited log growth
+- **Write Buffering**: Reduces system calls and improves throughput for small writes
+- **Zero Copy Reads**: Memory-mapped files eliminate data copying for faster access
 
 ## Configuration
 
@@ -183,8 +187,8 @@ config := walrus.Config{
     MaxSegments:     100,           // Keep max 100 segments
     CachedSegments:  10,            // Cache 10 segments in memory
     SyncAfterWrite:  true,          // Sync after each write
-    SyncInterval:    time.Second,   // Periodic sync interval
     BufferSize:      4096,          // I/O buffer size
+    ZeroCopy:        true,          // Enable zero-copy reads
     Format:          walrus.BINARY, // Binary or JSON encoding
 }
 ```

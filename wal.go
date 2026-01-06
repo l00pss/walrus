@@ -391,6 +391,11 @@ func (w *WAL) ensureSegment() error {
 		w.segments = segments
 		for _, seg := range w.segments {
 			seg.wal = w
+			if w.config.zeroCopy {
+				if err := seg.enableZeroCopy(); err != nil {
+					continue
+				}
+			}
 		}
 		w.currentSegment = segments[len(segments)-1]
 		return nil
@@ -419,8 +424,12 @@ func (w *WAL) rotateSegment() error {
 		return err
 	}
 
-	// Set WAL reference for buffered writes
 	segment.wal = w
+
+	if w.config.zeroCopy {
+		if err := segment.enableZeroCopy(); err != nil {
+		}
+	}
 
 	w.segments = append(w.segments, segment)
 	w.currentSegment = segment
@@ -442,6 +451,10 @@ func (w *WAL) cleanupOldSegments() {
 }
 
 func (w *WAL) Get(index uint64) result.Result[Entry] {
+	if w.config.zeroCopy {
+		return w.GetZeroCopy(index)
+	}
+
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 
@@ -456,6 +469,51 @@ func (w *WAL) Get(index uint64) result.Result[Entry] {
 	segment := w.findSegmentByIndex(index)
 	if segment == nil {
 		return result.Err[Entry](ErrSegmentNotFound)
+	}
+
+	data, err := segment.GetEntryByIndex(index)
+	if err != nil {
+		return result.Err[Entry](err)
+	}
+
+	entryResult := w.encoder.Decode(data)
+	if entryResult.IsErr() {
+		return result.Err[Entry](entryResult.UnwrapErr())
+	}
+
+	return result.Ok(entryResult.Unwrap())
+}
+
+func (w *WAL) GetZeroCopy(index uint64) result.Result[Entry] {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+
+	if w.state == Closed {
+		return result.Err[Entry](ErrWALClosed)
+	}
+
+	if index < w.cusror.FirstIndex || index > w.cusror.LastIndex {
+		return result.Err[Entry](ErrIndexOutOfRange)
+	}
+
+	segment := w.findSegmentByIndex(index)
+	if segment == nil {
+		return result.Err[Entry](ErrSegmentNotFound)
+	}
+
+	if w.config.zeroCopy && segment.zeroCopyMode {
+		data, err := segment.GetEntryByIndexZeroCopy(index)
+		if err != nil {
+			return result.Err[Entry](err)
+		}
+
+		if zeroCopyEncoder, ok := w.encoder.(ZeroCopyEncoder); ok {
+			entryResult := zeroCopyEncoder.DecodeZeroCopy(data)
+			if entryResult.IsErr() {
+				return result.Err[Entry](entryResult.UnwrapErr())
+			}
+			return result.Ok(entryResult.Unwrap())
+		}
 	}
 
 	data, err := segment.GetEntryByIndex(index)
@@ -514,6 +572,64 @@ func (w *WAL) GetRange(start, end uint64) result.Result[[]Entry] {
 	return result.Ok(entries)
 }
 
+func (w *WAL) GetRangeZeroCopy(start, end uint64) result.Result[[]Entry] {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+
+	if w.state == Closed {
+		return result.Err[[]Entry](ErrWALClosed)
+	}
+
+	if start > end {
+		return result.Err[[]Entry](ErrIndexOutOfRange)
+	}
+
+	if start < w.cusror.FirstIndex {
+		start = w.cusror.FirstIndex
+	}
+	if end > w.cusror.LastIndex {
+		end = w.cusror.LastIndex
+	}
+
+	entries := make([]Entry, 0, end-start+1)
+	zeroCopyEncoder, hasZeroCopy := w.encoder.(ZeroCopyEncoder)
+
+	for i := start; i <= end; i++ {
+		segment := w.findSegmentByIndex(i)
+		if segment == nil {
+			continue
+		}
+
+		if w.config.zeroCopy && segment.zeroCopyMode && hasZeroCopy {
+			data, err := segment.GetEntryByIndexZeroCopy(i)
+			if err != nil {
+				return result.Err[[]Entry](err)
+			}
+
+			entryResult := zeroCopyEncoder.DecodeZeroCopy(data)
+			if entryResult.IsErr() {
+				return result.Err[[]Entry](entryResult.UnwrapErr())
+			}
+
+			entries = append(entries, entryResult.Unwrap())
+		} else {
+			data, err := segment.GetEntryByIndex(i)
+			if err != nil {
+				return result.Err[[]Entry](err)
+			}
+
+			entryResult := w.encoder.Decode(data)
+			if entryResult.IsErr() {
+				return result.Err[[]Entry](entryResult.UnwrapErr())
+			}
+
+			entries = append(entries, entryResult.Unwrap())
+		}
+	}
+
+	return result.Ok(entries)
+}
+
 func (w *WAL) findSegmentByIndex(index uint64) *Segment {
 	for _, seg := range w.segments {
 		if seg.ContainsIndex(index) {
@@ -565,6 +681,11 @@ func (w *WAL) recover() error {
 	w.segments = segments
 	for _, seg := range w.segments {
 		seg.wal = w
+		if w.config.zeroCopy {
+			if err := seg.enableZeroCopy(); err != nil {
+				continue
+			}
+		}
 	}
 	w.currentSegment = segments[len(segments)-1]
 

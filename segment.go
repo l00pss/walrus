@@ -9,6 +9,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -26,6 +28,9 @@ type Segment struct {
 	firstEntry   uint64
 	lastEntry    uint64
 	entryOffsets []int64
+	mmapData     []byte
+	mmapSize     int64
+	zeroCopyMode bool
 }
 
 func (s *Segment) Write(data []byte) (int, error) {
@@ -72,6 +77,11 @@ func (s *Segment) Sync() error {
 }
 
 func (s *Segment) Close() error {
+	// Cleanup mmap before closing file
+	if err := s.disableZeroCopy(); err != nil {
+		return err
+	}
+
 	if s.file == nil {
 		return nil
 	}
@@ -142,6 +152,99 @@ func (s *Segment) ReadAll() ([][]byte, error) {
 	}
 
 	return entries, nil
+}
+
+func (s *Segment) enableZeroCopy() error {
+	if s.zeroCopyMode {
+		return nil
+	}
+
+	if s.file == nil {
+		return ErrSegmentNotFound
+	}
+
+	info, err := s.file.Stat()
+	if err != nil {
+		return err
+	}
+
+	if info.Size() == 0 {
+		s.zeroCopyMode = true
+		return nil
+	}
+
+	s.mmapSize = info.Size()
+	s.mmapData, err = unix.Mmap(int(s.file.Fd()), 0, int(s.mmapSize), unix.PROT_READ, unix.MAP_SHARED)
+	if err != nil {
+		return err
+	}
+
+	s.zeroCopyMode = true
+	return nil
+}
+
+func (s *Segment) disableZeroCopy() error {
+	if !s.zeroCopyMode {
+		return nil
+	}
+
+	if s.mmapData != nil {
+		err := unix.Munmap(s.mmapData)
+		if err != nil {
+			return err
+		}
+		s.mmapData = nil
+		s.mmapSize = 0
+	}
+
+	s.zeroCopyMode = false
+	return nil
+}
+
+func (s *Segment) ReadAtZeroCopy(offset int64) ([]byte, int64, error) {
+	if !s.zeroCopyMode || s.mmapData == nil {
+		return s.ReadAt(offset)
+	}
+
+	if offset >= s.mmapSize || offset < 0 {
+		return nil, 0, io.EOF
+	}
+
+	if offset+EntryLengthSize > s.mmapSize {
+		return nil, 0, io.EOF
+	}
+
+	lengthBytes := s.mmapData[offset : offset+EntryLengthSize]
+	entryLen := binary.LittleEndian.Uint32(lengthBytes)
+
+	dataOffset := offset + EntryLengthSize
+	if dataOffset+int64(entryLen) > s.mmapSize {
+		return nil, 0, io.EOF
+	}
+
+	data := s.mmapData[dataOffset : dataOffset+int64(entryLen)]
+	nextOffset := dataOffset + int64(entryLen)
+
+	return data, nextOffset, nil
+}
+
+func (s *Segment) GetEntryByIndexZeroCopy(entryIndex uint64) ([]byte, error) {
+	if !s.ContainsIndex(entryIndex) {
+		return nil, ErrIndexOutOfRange
+	}
+
+	if !s.zeroCopyMode {
+		return s.GetEntryByIndex(entryIndex)
+	}
+
+	localIndex := entryIndex - s.firstEntry
+	if localIndex >= uint64(len(s.entryOffsets)) {
+		return nil, ErrIndexOutOfRange
+	}
+
+	offset := s.entryOffsets[localIndex]
+	data, _, err := s.ReadAtZeroCopy(offset)
+	return data, err
 }
 
 func createSegment(dir string, index uint64) (*Segment, error) {

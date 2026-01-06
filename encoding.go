@@ -17,6 +17,12 @@ const (
 type Encoder interface {
 	Encode(entry Entry) result.Result[[]byte]
 	Decode(data []byte) result.Result[Entry]
+	EncodeInPlace(entry Entry, buffer []byte) result.Result[int]
+}
+
+type ZeroCopyEncoder interface {
+	DecodeZeroCopy(data []byte) result.Result[Entry]
+	EstimateSize(entry Entry) int
 }
 
 type BinaryEncoder struct{}
@@ -108,6 +114,113 @@ func (e BinaryEncoder) Decode(data []byte) result.Result[Entry] {
 	return result.Ok(entry)
 }
 
+func (e BinaryEncoder) EncodeInPlace(entry Entry, buffer []byte) result.Result[int] {
+	if len(buffer) < e.EstimateSize(entry) {
+		return result.Err[int](ErrInvalidEntry)
+	}
+
+	pos := 0
+
+	// Write Index
+	binary.LittleEndian.PutUint64(buffer[pos:], entry.Index)
+	pos += 8
+
+	// Write Term
+	binary.LittleEndian.PutUint64(buffer[pos:], entry.Term)
+	pos += 8
+
+	// Write Timestamp
+	binary.LittleEndian.PutUint64(buffer[pos:], uint64(entry.Timestamp.UnixNano()))
+	pos += 8
+
+	// Write Data Length
+	binary.LittleEndian.PutUint32(buffer[pos:], uint32(len(entry.Data)))
+	pos += 4
+
+	// Write Data
+	copy(buffer[pos:], entry.Data)
+	pos += len(entry.Data)
+
+	// Write Transaction ID
+	txIDBytes := []byte(string(entry.TransactionID))
+	binary.LittleEndian.PutUint32(buffer[pos:], uint32(len(txIDBytes)))
+	pos += 4
+	copy(buffer[pos:], txIDBytes)
+	pos += len(txIDBytes)
+
+	// Calculate and write checksum
+	checksum := crc32.ChecksumIEEE(buffer[:pos])
+	binary.LittleEndian.PutUint32(buffer[pos:], checksum)
+	pos += 4
+
+	return result.Ok(pos)
+}
+
+func (e BinaryEncoder) EstimateSize(entry Entry) int {
+	return EntryHeaderSize + len(entry.Data) + len([]byte(string(entry.TransactionID)))
+}
+
+func (e BinaryEncoder) DecodeZeroCopy(data []byte) result.Result[Entry] {
+	if len(data) < EntryHeaderSize {
+		return result.Err[Entry](ErrInvalidEntry)
+	}
+
+	pos := 0
+	var entry Entry
+
+	// Read Index
+	entry.Index = binary.LittleEndian.Uint64(data[pos:])
+	pos += 8
+
+	// Read Term
+	entry.Term = binary.LittleEndian.Uint64(data[pos:])
+	pos += 8
+
+	// Read Timestamp
+	timestamp := binary.LittleEndian.Uint64(data[pos:])
+	entry.Timestamp = time.Unix(0, int64(timestamp))
+	pos += 8
+
+	// Read Data Length
+	dataLen := binary.LittleEndian.Uint32(data[pos:])
+	pos += 4
+
+	if pos+int(dataLen) > len(data) {
+		return result.Err[Entry](ErrInvalidEntry)
+	}
+
+	// Zero copy data reference (no copying!)
+	entry.Data = data[pos : pos+int(dataLen)]
+	pos += int(dataLen)
+
+	// Read Transaction ID Length
+	if pos+4 > len(data) {
+		return result.Err[Entry](ErrInvalidEntry)
+	}
+	txIDLen := binary.LittleEndian.Uint32(data[pos:])
+	pos += 4
+
+	if txIDLen > 0 {
+		if pos+int(txIDLen) > len(data) {
+			return result.Err[Entry](ErrInvalidEntry)
+		}
+		entry.TransactionID = TransactionID(string(data[pos : pos+int(txIDLen)]))
+		pos += int(txIDLen)
+	}
+
+	if pos+4 > len(data) {
+		return result.Err[Entry](ErrInvalidEntry)
+	}
+	entry.Checksum = binary.LittleEndian.Uint32(data[pos:])
+
+	expectedChecksum := crc32.ChecksumIEEE(data[:len(data)-4])
+	if entry.Checksum != expectedChecksum {
+		return result.Err[Entry](ErrChecksumMismatch)
+	}
+
+	return result.Ok(entry)
+}
+
 type JSONEncoder struct{}
 
 type jsonEntry struct {
@@ -177,4 +290,28 @@ func (e JSONEncoder) Decode(data []byte) result.Result[Entry] {
 		Timestamp:     time.Unix(0, je.Timestamp),
 		TransactionID: TransactionID(je.TransactionID),
 	})
+}
+
+func (e JSONEncoder) EncodeInPlace(entry Entry, buffer []byte) result.Result[int] {
+	regularResult := e.Encode(entry)
+	if regularResult.IsErr() {
+		return result.Err[int](regularResult.UnwrapErr())
+	}
+
+	data := regularResult.Unwrap()
+	if len(buffer) < len(data) {
+		return result.Err[int](ErrInvalidEntry)
+	}
+
+	copy(buffer, data)
+	return result.Ok(len(data))
+}
+
+func (e JSONEncoder) EstimateSize(entry Entry) int {
+	baseSize := 200
+	return baseSize + len(entry.Data) + len([]byte(string(entry.TransactionID)))
+}
+
+func (e JSONEncoder) DecodeZeroCopy(data []byte) result.Result[Entry] {
+	return e.Decode(data)
 }
