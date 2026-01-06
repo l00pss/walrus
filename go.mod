@@ -7,6 +7,8 @@ require (
 	github.com/l00pss/littlecache v1.0.0
 )
 
+require golang.org/x/sys v0.39.0 // indirect
+
 // replace github.com/l00pss/helpme/goerr => ../goerr
 // replace github.com/l00pss/helpme/result => ../result
 // replace github.com/l00pss/littlecache => ../littlecache

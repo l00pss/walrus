@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/l00pss/helpme/result"
+	"github.com/l00pss/littlecache"
 )
 
 type LogFormat int
@@ -20,6 +21,8 @@ type Config struct {
 	dir                        string
 	segmentSize                int64
 	cachedSegments             int
+	cacheMaxItemSize           int
+	evictionPolicy             littlecache.EvictionPolicy
 	maxSegments                int
 	syncInterval               time.Duration
 	bufferSize                 int
@@ -37,6 +40,12 @@ func (c *Config) Validate() result.Result[Config] {
 	}
 	if c.cachedSegments <= 0 {
 		return result.Err[Config](errors.New("cached segments must be greater than 0"))
+	}
+	if c.cacheMaxItemSize <= 0 {
+		c.cacheMaxItemSize = 1024
+	}
+	if c.evictionPolicy == littlecache.EvictionPolicy(0) {
+		c.evictionPolicy = littlecache.LRU
 	}
 	if c.maxSegments <= 0 {
 		return result.Err[Config](errors.New("max segments must be greater than 0"))

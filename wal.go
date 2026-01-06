@@ -44,7 +44,11 @@ func NewWAL(dir string, config Config) result.Result[*WAL] {
 		return result.Err[*WAL](err)
 	}
 
-	cacheConfig := littlecache.DefaultConfig()
+	cacheConfig := littlecache.Config{
+		MaxSize:        config.cacheMaxItemSize,
+		EvictionPolicy: config.evictionPolicy,
+	}
+
 	cache, err := littlecache.NewLittleCache(cacheConfig)
 
 	if err != nil {
