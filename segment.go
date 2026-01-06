@@ -18,6 +18,7 @@ const (
 )
 
 type Segment struct {
+	wal          *WAL
 	path         string
 	index        uint64
 	filePath     string
@@ -35,6 +36,18 @@ func (s *Segment) Write(data []byte) (int, error) {
 	lengthBuf := make([]byte, EntryLengthSize)
 	binary.LittleEndian.PutUint32(lengthBuf, uint32(len(data)))
 
+	if s.wal != nil {
+		if err := s.wal.bufferedWrite(lengthBuf); err != nil {
+			return 0, err
+		}
+
+		if err := s.wal.bufferedWrite(data); err != nil {
+			return 0, err
+		}
+
+		return EntryLengthSize + len(data), nil
+	}
+
 	n, err := s.file.Write(lengthBuf)
 	if err != nil {
 		return n, err
@@ -48,6 +61,13 @@ func (s *Segment) Sync() error {
 	if s.file == nil {
 		return ErrSegmentNotFound
 	}
+
+	if s.wal != nil {
+		if err := s.wal.flushBuffer(); err != nil {
+			return err
+		}
+	}
+
 	return s.file.Sync()
 }
 
@@ -66,6 +86,15 @@ func (s *Segment) Size() (int64, error) {
 	if err != nil {
 		return 0, err
 	}
+
+	// Add buffered data size if WAL reference exists
+	if s.wal != nil {
+		s.wal.bufferMu.Lock()
+		bufferedSize := int64(s.wal.bufferPos)
+		s.wal.bufferMu.Unlock()
+		return info.Size() + bufferedSize, nil
+	}
+
 	return info.Size(), nil
 }
 

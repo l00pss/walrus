@@ -28,6 +28,9 @@ type WAL struct {
 	batch          Batch
 	transactions   map[TransactionID]*Transaction
 	transactionsMu sync.RWMutex
+	writeBuffer    []byte
+	bufferPos      int
+	bufferMu       sync.Mutex
 }
 
 func NewWAL(dir string, config Config) result.Result[*WAL] {
@@ -69,6 +72,9 @@ func NewWAL(dir string, config Config) result.Result[*WAL] {
 		cache:          &cache,
 		transactions:   make(map[TransactionID]*Transaction),
 		transactionsMu: sync.RWMutex{},
+		writeBuffer:    make([]byte, config.bufferSize),
+		bufferPos:      0,
+		bufferMu:       sync.Mutex{},
 	}
 
 	return result.Ok(w)
@@ -186,6 +192,7 @@ func (w *WAL) WriteBatch(entries []Entry) result.Result[[]uint64] {
 		seralizedEntryResult := w.encoder.Encode(entry)
 		data := seralizedEntryResult.Unwrap()
 
+		// Get current offset before writing (includes buffer position)
 		currentOffset, _ := w.currentSegment.Size()
 		_, err := w.currentSegment.Write(data)
 		if err != nil {
@@ -378,6 +385,9 @@ func (w *WAL) ensureSegment() error {
 
 	if len(segments) > 0 {
 		w.segments = segments
+		for _, seg := range w.segments {
+			seg.wal = w
+		}
 		w.currentSegment = segments[len(segments)-1]
 		return nil
 	}
@@ -387,6 +397,9 @@ func (w *WAL) ensureSegment() error {
 
 func (w *WAL) rotateSegment() error {
 	if w.currentSegment != nil {
+		if err := w.flushBuffer(); err != nil {
+			return err
+		}
 		if err := w.currentSegment.Sync(); err != nil {
 			return err
 		}
@@ -401,6 +414,9 @@ func (w *WAL) rotateSegment() error {
 	if err != nil {
 		return err
 	}
+
+	// Set WAL reference for buffered writes
+	segment.wal = w
 
 	w.segments = append(w.segments, segment)
 	w.currentSegment = segment
@@ -543,6 +559,9 @@ func (w *WAL) recover() error {
 	}
 
 	w.segments = segments
+	for _, seg := range w.segments {
+		seg.wal = w
+	}
 	w.currentSegment = segments[len(segments)-1]
 
 	for _, seg := range segments {
@@ -643,6 +662,11 @@ func (w *WAL) Close() error {
 		return nil
 	}
 
+	// Flush any remaining buffer data before closing
+	if err := w.flushBuffer(); err != nil {
+		return err
+	}
+
 	w.rollbackAllPendingTransactions()
 
 	for _, seg := range w.segments {
@@ -681,4 +705,74 @@ func (w *WAL) StartTransactionCleanup() {
 			w.CleanupExpiredTransactions()
 		}
 	}()
+}
+
+func (w *WAL) flushBuffer() error {
+	w.bufferMu.Lock()
+	defer w.bufferMu.Unlock()
+
+	if w.bufferPos == 0 {
+		return nil
+	}
+
+	if w.currentSegment == nil {
+		if err := w.ensureSegment(); err != nil {
+			return err
+		}
+	}
+
+	_, err := w.currentSegment.file.Write(w.writeBuffer[:w.bufferPos])
+	if err != nil {
+		return err
+	}
+
+	w.bufferPos = 0
+
+	return nil
+}
+
+func (w *WAL) bufferedWrite(data []byte) error {
+	w.bufferMu.Lock()
+	defer w.bufferMu.Unlock()
+
+	if len(data) > len(w.writeBuffer) {
+		if w.bufferPos > 0 {
+			if err := w.flushBufferUnsafe(); err != nil {
+				return err
+			}
+		}
+		_, err := w.currentSegment.file.Write(data)
+		return err
+	}
+
+	if w.bufferPos+len(data) > len(w.writeBuffer) {
+		if err := w.flushBufferUnsafe(); err != nil {
+			return err
+		}
+	}
+
+	copy(w.writeBuffer[w.bufferPos:], data)
+	w.bufferPos += len(data)
+
+	return nil
+}
+
+func (w *WAL) flushBufferUnsafe() error {
+	if w.bufferPos == 0 {
+		return nil
+	}
+
+	if w.currentSegment == nil {
+		if err := w.ensureSegment(); err != nil {
+			return err
+		}
+	}
+
+	_, err := w.currentSegment.file.Write(w.writeBuffer[:w.bufferPos])
+	if err != nil {
+		return err
+	}
+
+	w.bufferPos = 0
+	return nil
 }
