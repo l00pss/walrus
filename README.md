@@ -2,12 +2,12 @@
 
 <br>
 <div align="center">
-  <img src="logo.png" alt="LittleCache Logo" width="800"/>
+  <img src="logo.png" alt="Walrus Logo" width="800"/>
   <br><br>
-  <a href="https://golang.org/"><img src="https://img.shields.io/badge/go-1.25+-00ADD8?style=flat&logo=go&logoColor=white" alt="Go Version"></a>
+  <a href="https://golang.org/"><img src="https://img.shields.io/badge/go-1.21+-00ADD8?style=flat&logo=go&logoColor=white" alt="Go Version"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat" alt="License"></a>
-  <a href="https://goreportcard.com/report/github.com/l00pss/littlecache"><img src="https://goreportcard.com/badge/github.com/l00pss/littlecache" alt="Go Report Card"></a>
-  <a href="https://github.com/l00pss/littlecache/stargazers"><img src="https://img.shields.io/github/stars/l00pss/littlecache?style=flat&logo=github" alt="GitHub Stars"></a>
+  <a href="https://goreportcard.com/report/github.com/l00pss/walrus"><img src="https://goreportcard.com/badge/github.com/l00pss/walrus" alt="Go Report Card"></a>
+  <a href="https://github.com/l00pss/walrus/stargazers"><img src="https://img.shields.io/github/stars/l00pss/walrus?style=flat&logo=github" alt="GitHub Stars"></a>
 </div>
 
 <br>
@@ -192,6 +192,18 @@ config := walrus.Config{
     Format:          walrus.BINARY, // Binary or JSON encoding
 }
 ```
+
+## Installation
+
+```bash
+go get github.com/l00pss/walrus
+```
+
+## Repository
+
+- **GitHub**: [https://github.com/l00pss/walrus](https://github.com/l00pss/walrus)
+- **Issues**: [https://github.com/l00pss/walrus/issues](https://github.com/l00pss/walrus/issues)
+- **Releases**: [https://github.com/l00pss/walrus/releases](https://github.com/l00pss/walrus/releases)
 
 ## License
 
