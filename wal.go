@@ -839,12 +839,10 @@ func (w *WAL) Close() error {
 
 	w.logger.Info("closing WAL", "dir", w.dir)
 
-	// Signal cleanup goroutine to stop
 	if w.cleanupDone != nil {
 		close(w.cleanupDone)
 	}
 
-	// Flush any remaining buffer data before closing
 	if err := w.flushBuffer(); err != nil {
 		w.logger.Error("failed to flush buffer on close", "error", err)
 		return err
