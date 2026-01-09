@@ -1,4 +1,4 @@
-module walrus
+module github.com/l00pss/walrus
 
 go 1.25
 
@@ -9,6 +9,3 @@ require (
 
 require golang.org/x/sys v0.39.0
 
-// replace github.com/l00pss/helpme/goerr => ../goerr
-// replace github.com/l00pss/helpme/result => ../result
-// replace github.com/l00pss/littlecache => ../littlecache
