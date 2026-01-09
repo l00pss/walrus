@@ -77,7 +77,6 @@ func (s *Segment) Sync() error {
 }
 
 func (s *Segment) Close() error {
-	// Cleanup mmap before closing file
 	if err := s.disableZeroCopy(); err != nil {
 		return err
 	}
@@ -95,14 +94,6 @@ func (s *Segment) Size() (int64, error) {
 	info, err := s.file.Stat()
 	if err != nil {
 		return 0, err
-	}
-
-	// Add buffered data size if WAL reference exists
-	if s.wal != nil {
-		s.wal.bufferMu.Lock()
-		bufferedSize := int64(s.wal.bufferPos)
-		s.wal.bufferMu.Unlock()
-		return info.Size() + bufferedSize, nil
 	}
 
 	return info.Size(), nil

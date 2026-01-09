@@ -19,7 +19,7 @@ type WAL struct {
 	encoder        Encoder
 	state          State
 	status         Status
-	cusror         Cursor
+	cursor         Cursor
 	dir            string
 	tailSFH        os.File
 	segments       []*Segment
@@ -70,7 +70,7 @@ func NewWAL(dir string, config Config) result.Result[*WAL] {
 		encoder:        encoder,
 		state:          Initializing,
 		status:         OK,
-		cusror:         StartCursor(),
+		cursor:         StartCursor(),
 		dir:            dir,
 		config:         configResult.Unwrap(),
 		cache:          &cache,
@@ -116,7 +116,7 @@ func (w *WAL) Append(entry Entry) result.Result[uint64] {
 		}
 	}
 
-	entry.Index = w.cusror.LastIndex + 1
+	entry.Index = w.cursor.LastIndex + 1
 
 	seralizedEntryResult := w.encoder.Encode(entry)
 	if seralizedEntryResult.IsErr() {
@@ -138,9 +138,9 @@ func (w *WAL) Append(entry Entry) result.Result[uint64] {
 		}
 	}
 
-	w.cusror.LastIndex = entry.Index
-	if w.cusror.FirstIndex == 0 {
-		w.cusror.FirstIndex = entry.Index
+	w.cursor.LastIndex = entry.Index
+	if w.cursor.FirstIndex == 0 {
+		w.cursor.FirstIndex = entry.Index
 	}
 
 	return result.Ok(entry.Index)
@@ -168,7 +168,7 @@ func (w *WAL) WriteBatch(entries []Entry) result.Result[[]uint64] {
 	totalSize := 0
 
 	for i := range entries {
-		indices[i] = w.cusror.LastIndex + uint64(i) + 1
+		indices[i] = w.cursor.LastIndex + uint64(i) + 1
 		entries[i].Index = indices[i]
 		if entries[i].Timestamp.IsZero() {
 			entries[i].Timestamp = time.Now()
@@ -192,19 +192,20 @@ func (w *WAL) WriteBatch(entries []Entry) result.Result[[]uint64] {
 	}
 
 	startOffset, _ := w.currentSegment.Size()
+	currentOffset := startOffset
 	for _, entry := range entries {
 		seralizedEntryResult := w.encoder.Encode(entry)
 		data := seralizedEntryResult.Unwrap()
 
-		// Get current offset before writing (includes buffer position)
-		currentOffset, _ := w.currentSegment.Size()
+		w.currentSegment.TrackEntry(entry.Index, currentOffset)
+
 		_, err := w.currentSegment.Write(data)
 		if err != nil {
 			w.currentSegment.file.Truncate(startOffset)
 			return result.Err[[]uint64](err)
 		}
 
-		w.currentSegment.TrackEntry(entry.Index, currentOffset)
+		currentOffset += int64(EntryLengthSize + len(data))
 	}
 
 	if w.config.syncAfterWrite {
@@ -213,9 +214,9 @@ func (w *WAL) WriteBatch(entries []Entry) result.Result[[]uint64] {
 			return result.Err[[]uint64](err)
 		}
 	}
-	w.cusror.LastIndex = indices[len(indices)-1]
-	if w.cusror.FirstIndex == 0 {
-		w.cusror.FirstIndex = indices[0]
+	w.cursor.LastIndex = indices[len(indices)-1]
+	if w.cursor.FirstIndex == 0 {
+		w.cursor.FirstIndex = indices[0]
 	}
 
 	return result.Ok(indices)
@@ -282,35 +283,34 @@ func (w *WAL) AddToTransaction(txID TransactionID, entry Entry) result.Result[st
 
 func (w *WAL) CommitTransaction(txID TransactionID) result.Result[[]uint64] {
 	w.transactionsMu.Lock()
+	defer w.transactionsMu.Unlock()
+
 	tx, exists := w.transactions[txID]
 	if !exists {
-		w.transactionsMu.Unlock()
 		return result.Err[[]uint64](ErrTransactionNotFound)
 	}
 
 	if tx.State != TransactionPending {
-		w.transactionsMu.Unlock()
 		return result.Err[[]uint64](ErrTransactionNotPending)
 	}
 
 	if tx.IsExpired() {
 		tx.State = TransactionAborted
-		w.transactionsMu.Unlock()
 		return result.Err[[]uint64](ErrTransactionExpired)
 	}
+
+	// Defer deleting the transaction until the function returns.
+	defer delete(w.transactions, txID)
 
 	tx.State = TransactionCommitted
 	entries := make([]Entry, len(tx.Entries))
 	copy(entries, tx.Entries)
+
 	w.transactionsMu.Unlock()
-
-	result := w.WriteBatch(entries)
-
+	res := w.WriteBatch(entries)
 	w.transactionsMu.Lock()
-	delete(w.transactions, txID)
-	w.transactionsMu.Unlock()
 
-	return result
+	return res
 }
 
 func (w *WAL) RollbackTransaction(txID TransactionID) result.Result[struct{}] {
@@ -462,7 +462,7 @@ func (w *WAL) Get(index uint64) result.Result[Entry] {
 		return result.Err[Entry](ErrWALClosed)
 	}
 
-	if index < w.cusror.FirstIndex || index > w.cusror.LastIndex {
+	if index < w.cursor.FirstIndex || index > w.cursor.LastIndex {
 		return result.Err[Entry](ErrIndexOutOfRange)
 	}
 
@@ -492,7 +492,7 @@ func (w *WAL) GetZeroCopy(index uint64) result.Result[Entry] {
 		return result.Err[Entry](ErrWALClosed)
 	}
 
-	if index < w.cusror.FirstIndex || index > w.cusror.LastIndex {
+	if index < w.cursor.FirstIndex || index > w.cursor.LastIndex {
 		return result.Err[Entry](ErrIndexOutOfRange)
 	}
 
@@ -541,11 +541,11 @@ func (w *WAL) GetRange(start, end uint64) result.Result[[]Entry] {
 		return result.Err[[]Entry](ErrIndexOutOfRange)
 	}
 
-	if start < w.cusror.FirstIndex {
-		start = w.cusror.FirstIndex
+	if start < w.cursor.FirstIndex {
+		start = w.cursor.FirstIndex
 	}
-	if end > w.cusror.LastIndex {
-		end = w.cusror.LastIndex
+	if end > w.cursor.LastIndex {
+		end = w.cursor.LastIndex
 	}
 
 	entries := make([]Entry, 0, end-start+1)
@@ -584,11 +584,11 @@ func (w *WAL) GetRangeZeroCopy(start, end uint64) result.Result[[]Entry] {
 		return result.Err[[]Entry](ErrIndexOutOfRange)
 	}
 
-	if start < w.cusror.FirstIndex {
-		start = w.cusror.FirstIndex
+	if start < w.cursor.FirstIndex {
+		start = w.cursor.FirstIndex
 	}
-	if end > w.cusror.LastIndex {
-		end = w.cusror.LastIndex
+	if end > w.cursor.LastIndex {
+		end = w.cursor.LastIndex
 	}
 
 	entries := make([]Entry, 0, end-start+1)
@@ -642,13 +642,13 @@ func (w *WAL) findSegmentByIndex(index uint64) *Segment {
 func (w *WAL) GetFirstIndex() uint64 {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
-	return w.cusror.FirstIndex
+	return w.cursor.FirstIndex
 }
 
 func (w *WAL) GetLastIndex() uint64 {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
-	return w.cusror.LastIndex
+	return w.cursor.LastIndex
 }
 
 func Open(dir string, config Config) result.Result[*WAL] {
@@ -719,10 +719,10 @@ func (w *WAL) recoverSegment(seg *Segment) error {
 		entry := entryResult.Unwrap()
 		seg.TrackEntry(entry.Index, offset)
 
-		if w.cusror.FirstIndex == 0 {
-			w.cusror.FirstIndex = entry.Index
+		if w.cursor.FirstIndex == 0 {
+			w.cursor.FirstIndex = entry.Index
 		}
-		w.cusror.LastIndex = entry.Index
+		w.cursor.LastIndex = entry.Index
 
 		offset = nextOffset
 	}
@@ -745,7 +745,7 @@ func (w *WAL) Truncate(index uint64) result.Result[struct{}] {
 		return result.Err[struct{}](ErrWALClosed)
 	}
 
-	if index < w.cusror.FirstIndex || index > w.cusror.LastIndex {
+	if index < w.cursor.FirstIndex || index > w.cursor.LastIndex {
 		return result.Err[struct{}](ErrIndexOutOfRange)
 	}
 
@@ -771,7 +771,7 @@ func (w *WAL) Truncate(index uint64) result.Result[struct{}] {
 		}
 	}
 
-	w.cusror.LastIndex = index
+	w.cursor.LastIndex = index
 	if len(w.segments) > 0 {
 		w.currentSegment = w.segments[len(w.segments)-1]
 	}
