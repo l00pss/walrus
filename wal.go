@@ -1,6 +1,7 @@
 package walrus
 
 import (
+	"context"
 	"crypto/rand"
 	"fmt"
 	"io"
@@ -32,6 +33,7 @@ type WAL struct {
 	bufferPos      int
 	bufferMu       sync.Mutex
 	cleanupDone    chan struct{}
+	logger         Logger
 }
 
 func NewWAL(dir string, config Config) result.Result[*WAL] {
@@ -66,6 +68,11 @@ func NewWAL(dir string, config Config) result.Result[*WAL] {
 		encoder = JSONEncoder{}
 	}
 
+	logger := config.logger
+	if logger == nil {
+		logger = NoOpLogger{}
+	}
+
 	w := &WAL{
 		mu:             sync.RWMutex{},
 		encoder:        encoder,
@@ -81,8 +88,10 @@ func NewWAL(dir string, config Config) result.Result[*WAL] {
 		bufferPos:      0,
 		bufferMu:       sync.Mutex{},
 		cleanupDone:    make(chan struct{}),
+		logger:         logger,
 	}
 
+	w.logger.Info("WAL initialized", "dir", dir)
 	return result.Ok(w)
 }
 
@@ -95,25 +104,41 @@ func MkDirIfNotExist(dir string) result.Result[struct{}] {
 }
 
 func (w *WAL) Append(entry Entry) result.Result[uint64] {
+	return w.AppendWithContext(context.Background(), entry)
+}
+
+func (w *WAL) AppendWithContext(ctx context.Context, entry Entry) result.Result[uint64] {
+	select {
+	case <-ctx.Done():
+		w.logger.Warn("Append cancelled", "error", ctx.Err())
+		return result.Err[uint64](ctx.Err())
+	default:
+	}
+
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
 	if w.state == Closed {
+		w.logger.Warn("Append called on closed WAL")
 		return result.Err[uint64](ErrWALClosed)
 	}
 
 	if w.currentSegment == nil {
 		if err := w.ensureSegment(); err != nil {
+			w.logger.Error("failed to ensure segment", "error", err)
 			return result.Err[uint64](err)
 		}
 	}
 
 	size, err := w.currentSegment.Size()
 	if err != nil {
+		w.logger.Error("failed to get segment size", "error", err)
 		return result.Err[uint64](err)
 	}
 	if size >= w.config.segmentSize {
+		w.logger.Debug("rotating segment", "size", size)
 		if err := w.rotateSegment(); err != nil {
+			w.logger.Error("failed to rotate segment", "error", err)
 			return result.Err[uint64](err)
 		}
 	}
@@ -122,6 +147,7 @@ func (w *WAL) Append(entry Entry) result.Result[uint64] {
 
 	seralizedEntryResult := w.encoder.Encode(entry)
 	if seralizedEntryResult.IsErr() {
+		w.logger.Error("failed to encode entry", "error", seralizedEntryResult.UnwrapErr())
 		return result.Err[uint64](seralizedEntryResult.UnwrapErr())
 	}
 	data := seralizedEntryResult.Unwrap()
@@ -129,6 +155,7 @@ func (w *WAL) Append(entry Entry) result.Result[uint64] {
 	currentSize, _ := w.currentSegment.Size()
 	_, err = w.currentSegment.Write(data)
 	if err != nil {
+		w.logger.Error("failed to write entry", "error", err)
 		return result.Err[uint64](err)
 	}
 
@@ -136,6 +163,7 @@ func (w *WAL) Append(entry Entry) result.Result[uint64] {
 
 	if w.config.syncAfterWrite {
 		if err := w.currentSegment.Sync(); err != nil {
+			w.logger.Error("failed to sync segment", "error", err)
 			return result.Err[uint64](err)
 		}
 	}
@@ -145,14 +173,27 @@ func (w *WAL) Append(entry Entry) result.Result[uint64] {
 		w.cursor.FirstIndex = entry.Index
 	}
 
+	w.logger.Debug("entry appended", "index", entry.Index)
 	return result.Ok(entry.Index)
 }
 
 func (w *WAL) WriteBatch(entries []Entry) result.Result[[]uint64] {
+	return w.WriteBatchWithContext(context.Background(), entries)
+}
+
+func (w *WAL) WriteBatchWithContext(ctx context.Context, entries []Entry) result.Result[[]uint64] {
+	select {
+	case <-ctx.Done():
+		w.logger.Warn("WriteBatch cancelled", "error", ctx.Err())
+		return result.Err[[]uint64](ctx.Err())
+	default:
+	}
+
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
 	if w.state == Closed {
+		w.logger.Warn("WriteBatch called on closed WAL")
 		return result.Err[[]uint64](ErrWALClosed)
 	}
 
@@ -162,11 +203,13 @@ func (w *WAL) WriteBatch(entries []Entry) result.Result[[]uint64] {
 
 	if w.currentSegment == nil {
 		if err := w.ensureSegment(); err != nil {
+			w.logger.Error("failed to ensure segment", "error", err)
 			return result.Err[[]uint64](err)
 		}
 	}
 
 	indices := make([]uint64, len(entries))
+	encodedEntries := make([][]byte, len(entries))
 	totalSize := 0
 
 	for i := range entries {
@@ -178,31 +221,36 @@ func (w *WAL) WriteBatch(entries []Entry) result.Result[[]uint64] {
 
 		seralizedEntryResult := w.encoder.Encode(entries[i])
 		if seralizedEntryResult.IsErr() {
+			w.logger.Error("failed to encode entry", "index", entries[i].Index, "error", seralizedEntryResult.UnwrapErr())
 			return result.Err[[]uint64](seralizedEntryResult.UnwrapErr())
 		}
-		totalSize += len(seralizedEntryResult.Unwrap())
+		encodedEntries[i] = seralizedEntryResult.Unwrap()
+		totalSize += len(encodedEntries[i])
 	}
 
 	currentSize, err := w.currentSegment.Size()
 	if err != nil {
+		w.logger.Error("failed to get segment size", "error", err)
 		return result.Err[[]uint64](err)
 	}
 	if currentSize+int64(totalSize) >= w.config.segmentSize {
+		w.logger.Debug("rotating segment", "currentSize", currentSize, "totalSize", totalSize)
 		if err := w.rotateSegment(); err != nil {
+			w.logger.Error("failed to rotate segment", "error", err)
 			return result.Err[[]uint64](err)
 		}
 	}
 
 	startOffset, _ := w.currentSegment.Size()
 	currentOffset := startOffset
-	for _, entry := range entries {
-		seralizedEntryResult := w.encoder.Encode(entry)
-		data := seralizedEntryResult.Unwrap()
+	for i, entry := range entries {
+		data := encodedEntries[i]
 
 		w.currentSegment.TrackEntry(entry.Index, currentOffset)
 
 		_, err := w.currentSegment.Write(data)
 		if err != nil {
+			w.logger.Error("failed to write entry", "index", entry.Index, "error", err)
 			w.currentSegment.file.Truncate(startOffset)
 			return result.Err[[]uint64](err)
 		}
@@ -212,6 +260,7 @@ func (w *WAL) WriteBatch(entries []Entry) result.Result[[]uint64] {
 
 	if w.config.syncAfterWrite {
 		if err := w.currentSegment.Sync(); err != nil {
+			w.logger.Error("failed to sync segment", "error", err)
 			w.currentSegment.file.Truncate(startOffset)
 			return result.Err[[]uint64](err)
 		}
@@ -221,6 +270,7 @@ func (w *WAL) WriteBatch(entries []Entry) result.Result[[]uint64] {
 		w.cursor.FirstIndex = indices[0]
 	}
 
+	w.logger.Debug("batch written", "count", len(entries), "firstIndex", indices[0], "lastIndex", indices[len(indices)-1])
 	return result.Ok(indices)
 }
 
@@ -787,6 +837,8 @@ func (w *WAL) Close() error {
 		return nil
 	}
 
+	w.logger.Info("closing WAL", "dir", w.dir)
+
 	// Signal cleanup goroutine to stop
 	if w.cleanupDone != nil {
 		close(w.cleanupDone)
@@ -794,6 +846,7 @@ func (w *WAL) Close() error {
 
 	// Flush any remaining buffer data before closing
 	if err := w.flushBuffer(); err != nil {
+		w.logger.Error("failed to flush buffer on close", "error", err)
 		return err
 	}
 
@@ -808,6 +861,7 @@ func (w *WAL) Close() error {
 	w.currentSegment = nil
 	w.state = Closed
 
+	w.logger.Info("WAL closed successfully")
 	return nil
 }
 

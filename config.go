@@ -32,6 +32,7 @@ type Config struct {
 	transactionTimeout         time.Duration
 	maxTransactionEntries      int
 	transactionCleanupInterval time.Duration
+	logger                     Logger
 }
 
 func (c *Config) Validate() result.Result[Config] {
@@ -83,5 +84,6 @@ func DefaultConfig() Config {
 		transactionTimeout:         30 * time.Second,
 		maxTransactionEntries:      1000,
 		transactionCleanupInterval: 5 * time.Minute,
+		logger:                     NoOpLogger{},
 	}
 }

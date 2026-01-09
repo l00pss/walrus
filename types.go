@@ -5,6 +5,22 @@ import (
 	"time"
 )
 
+// Logger interface for WAL logging
+type Logger interface {
+	Debug(msg string, args ...any)
+	Info(msg string, args ...any)
+	Warn(msg string, args ...any)
+	Error(msg string, args ...any)
+}
+
+// NoOpLogger is a logger that does nothing (default)
+type NoOpLogger struct{}
+
+func (n NoOpLogger) Debug(msg string, args ...any) {}
+func (n NoOpLogger) Info(msg string, args ...any)  {}
+func (n NoOpLogger) Warn(msg string, args ...any)  {}
+func (n NoOpLogger) Error(msg string, args ...any) {}
+
 type State int
 
 const (
