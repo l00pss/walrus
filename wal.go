@@ -31,6 +31,7 @@ type WAL struct {
 	writeBuffer    []byte
 	bufferPos      int
 	bufferMu       sync.Mutex
+	cleanupDone    chan struct{}
 }
 
 func NewWAL(dir string, config Config) result.Result[*WAL] {
@@ -79,6 +80,7 @@ func NewWAL(dir string, config Config) result.Result[*WAL] {
 		writeBuffer:    make([]byte, config.bufferSize),
 		bufferPos:      0,
 		bufferMu:       sync.Mutex{},
+		cleanupDone:    make(chan struct{}),
 	}
 
 	return result.Ok(w)
@@ -283,34 +285,32 @@ func (w *WAL) AddToTransaction(txID TransactionID, entry Entry) result.Result[st
 
 func (w *WAL) CommitTransaction(txID TransactionID) result.Result[[]uint64] {
 	w.transactionsMu.Lock()
-	defer w.transactionsMu.Unlock()
 
 	tx, exists := w.transactions[txID]
 	if !exists {
+		w.transactionsMu.Unlock()
 		return result.Err[[]uint64](ErrTransactionNotFound)
 	}
 
 	if tx.State != TransactionPending {
+		w.transactionsMu.Unlock()
 		return result.Err[[]uint64](ErrTransactionNotPending)
 	}
 
 	if tx.IsExpired() {
 		tx.State = TransactionAborted
+		delete(w.transactions, txID)
+		w.transactionsMu.Unlock()
 		return result.Err[[]uint64](ErrTransactionExpired)
 	}
-
-	// Defer deleting the transaction until the function returns.
-	defer delete(w.transactions, txID)
 
 	tx.State = TransactionCommitted
 	entries := make([]Entry, len(tx.Entries))
 	copy(entries, tx.Entries)
-
+	delete(w.transactions, txID)
 	w.transactionsMu.Unlock()
-	res := w.WriteBatch(entries)
-	w.transactionsMu.Lock()
 
-	return res
+	return w.WriteBatch(entries)
 }
 
 func (w *WAL) RollbackTransaction(txID TransactionID) result.Result[struct{}] {
@@ -787,6 +787,11 @@ func (w *WAL) Close() error {
 		return nil
 	}
 
+	// Signal cleanup goroutine to stop
+	if w.cleanupDone != nil {
+		close(w.cleanupDone)
+	}
+
 	// Flush any remaining buffer data before closing
 	if err := w.flushBuffer(); err != nil {
 		return err
@@ -823,11 +828,19 @@ func (w *WAL) StartTransactionCleanup() {
 		ticker := time.NewTicker(w.config.transactionCleanupInterval)
 		defer ticker.Stop()
 
-		for range ticker.C {
-			if w.state == Closed {
+		for {
+			select {
+			case <-ticker.C:
+				w.mu.RLock()
+				state := w.state
+				w.mu.RUnlock()
+				if state == Closed {
+					return
+				}
+				w.CleanupExpiredTransactions()
+			case <-w.cleanupDone:
 				return
 			}
-			w.CleanupExpiredTransactions()
 		}
 	}()
 }
@@ -841,9 +854,7 @@ func (w *WAL) flushBuffer() error {
 	}
 
 	if w.currentSegment == nil {
-		if err := w.ensureSegment(); err != nil {
-			return err
-		}
+		return nil
 	}
 
 	_, err := w.currentSegment.file.Write(w.writeBuffer[:w.bufferPos])
@@ -888,9 +899,7 @@ func (w *WAL) flushBufferUnsafe() error {
 	}
 
 	if w.currentSegment == nil {
-		if err := w.ensureSegment(); err != nil {
-			return err
-		}
+		return nil
 	}
 
 	_, err := w.currentSegment.file.Write(w.writeBuffer[:w.bufferPos])
