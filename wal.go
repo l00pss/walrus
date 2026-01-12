@@ -598,6 +598,11 @@ func (w *WAL) GetRange(start, end uint64) result.Result[[]Entry] {
 		end = w.cursor.LastIndex
 	}
 
+	// Check for invalid range after adjustments (prevents uint64 underflow)
+	if start > end {
+		return result.Ok([]Entry{})
+	}
+
 	entries := make([]Entry, 0, end-start+1)
 
 	for i := start; i <= end; i++ {
@@ -639,6 +644,11 @@ func (w *WAL) GetRangeZeroCopy(start, end uint64) result.Result[[]Entry] {
 	}
 	if end > w.cursor.LastIndex {
 		end = w.cursor.LastIndex
+	}
+
+	// Check for invalid range after adjustments (prevents uint64 underflow)
+	if start > end {
+		return result.Ok([]Entry{})
 	}
 
 	entries := make([]Entry, 0, end-start+1)
