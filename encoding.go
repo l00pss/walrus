@@ -11,7 +11,8 @@ import (
 )
 
 const (
-	EntryHeaderSize = 8 + 8 + 4 + 8 + 4 + 4 // Index + Term + DataLen + Timestamp + Checksum + TxIDLen
+	// Layout: Index(8) + Term(8) + Timestamp(8) + DataLen(4) + TxIDLen(4) + Checksum(4) = 36 bytes
+	EntryHeaderSize = 8 + 8 + 8 + 4 + 4 + 4
 )
 
 type Encoder interface {

@@ -1942,8 +1942,8 @@ func TestNewWAL(t *testing.T) {
 	}
 
 	wal := walResult.Unwrap()
-	if wal.state != Initializing {
-		t.Errorf("expected state Initializing, got %v", wal.state)
+	if wal.state != Ready {
+		t.Errorf("expected state Ready, got %v", wal.state)
 	}
 
 	if wal.status != OK {

@@ -174,6 +174,45 @@ func (s *Segment) enableZeroCopy() error {
 	return nil
 }
 
+func (s *Segment) refreshMmap() error {
+	if !s.zeroCopyMode {
+		return nil
+	}
+
+	if s.file == nil {
+		return ErrSegmentNotFound
+	}
+
+	info, err := s.file.Stat()
+	if err != nil {
+		return err
+	}
+
+	if info.Size() == s.mmapSize {
+		return nil
+	}
+
+	if s.mmapData != nil {
+		if err := unix.Munmap(s.mmapData); err != nil {
+			return err
+		}
+		s.mmapData = nil
+	}
+
+	if info.Size() > 0 {
+		s.mmapSize = info.Size()
+		s.mmapData, err = unix.Mmap(int(s.file.Fd()), 0, int(s.mmapSize), unix.PROT_READ, unix.MAP_SHARED)
+		if err != nil {
+			s.mmapSize = 0
+			return err
+		}
+	} else {
+		s.mmapSize = 0
+	}
+
+	return nil
+}
+
 func (s *Segment) disableZeroCopy() error {
 	if !s.zeroCopyMode {
 		return nil

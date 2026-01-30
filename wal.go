@@ -58,7 +58,10 @@ func NewWAL(dir string, config Config) result.Result[*WAL] {
 		return result.Err[*WAL](err)
 	}
 	cache.Resize(config.cachedSegments * 1024)
-	MkDirIfNotExist(dir)
+
+	if mkdirResult := MkDirIfNotExist(dir); mkdirResult.IsErr() {
+		return result.Err[*WAL](mkdirResult.UnwrapErr())
+	}
 
 	var encoder Encoder
 	switch config.format {
@@ -76,7 +79,7 @@ func NewWAL(dir string, config Config) result.Result[*WAL] {
 	w := &WAL{
 		mu:             sync.RWMutex{},
 		encoder:        encoder,
-		state:          Initializing,
+		state:          Ready,
 		status:         OK,
 		cursor:         StartCursor(),
 		dir:            dir,
@@ -165,6 +168,12 @@ func (w *WAL) AppendWithContext(ctx context.Context, entry Entry) result.Result[
 		if err := w.currentSegment.Sync(); err != nil {
 			w.logger.Error("failed to sync segment", "error", err)
 			return result.Err[uint64](err)
+		}
+	}
+
+	if w.config.zeroCopy && w.currentSegment.zeroCopyMode {
+		if err := w.currentSegment.refreshMmap(); err != nil {
+			w.logger.Warn("failed to refresh mmap", "error", err)
 		}
 	}
 
@@ -265,6 +274,13 @@ func (w *WAL) WriteBatchWithContext(ctx context.Context, entries []Entry) result
 			return result.Err[[]uint64](err)
 		}
 	}
+
+	if w.config.zeroCopy && w.currentSegment.zeroCopyMode {
+		if err := w.currentSegment.refreshMmap(); err != nil {
+			w.logger.Warn("failed to refresh mmap", "error", err)
+		}
+	}
+
 	w.cursor.LastIndex = indices[len(indices)-1]
 	if w.cursor.FirstIndex == 0 {
 		w.cursor.FirstIndex = indices[0]
@@ -276,7 +292,9 @@ func (w *WAL) WriteBatchWithContext(ctx context.Context, entries []Entry) result
 
 func generateTransactionID() TransactionID {
 	b := make([]byte, 16)
-	rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		return TransactionID(fmt.Sprintf("tx_%d", time.Now().UnixNano()))
+	}
 	return TransactionID(fmt.Sprintf("tx_%x", b))
 }
 
@@ -382,8 +400,8 @@ func (w *WAL) RollbackTransaction(txID TransactionID) result.Result[struct{}] {
 }
 
 func (w *WAL) GetTransactionState(txID TransactionID) result.Result[TransactionState] {
-	w.transactionsMu.RLock()
-	defer w.transactionsMu.RUnlock()
+	w.transactionsMu.Lock()
+	defer w.transactionsMu.Unlock()
 
 	tx, exists := w.transactions[txID]
 	if !exists {
@@ -391,6 +409,8 @@ func (w *WAL) GetTransactionState(txID TransactionID) result.Result[TransactionS
 	}
 
 	if tx.IsExpired() && tx.State == TransactionPending {
+		tx.State = TransactionAborted
+		delete(w.transactions, txID)
 		return result.Ok(TransactionAborted)
 	}
 
@@ -497,6 +517,10 @@ func (w *WAL) cleanupOldSegments() {
 		oldest.Close()
 		os.Remove(oldest.filePath)
 		w.segments = w.segments[1:]
+	}
+
+	if len(w.segments) > 0 && w.segments[0].firstEntry > 0 {
+		w.cursor.FirstIndex = w.segments[0].firstEntry
 	}
 }
 
@@ -824,9 +848,15 @@ func (w *WAL) Truncate(index uint64) result.Result[struct{}] {
 			if localIdx < uint64(len(seg.entryOffsets)-1) {
 				nextOffset := seg.entryOffsets[localIdx+1]
 				seg.file.Truncate(nextOffset)
-				seg.lastEntry = index
-				seg.entryOffsets = seg.entryOffsets[:localIdx+1]
+			} else if localIdx == uint64(len(seg.entryOffsets)-1) {
+				data, _, err := seg.ReadAt(seg.entryOffsets[localIdx])
+				if err == nil {
+					endOffset := seg.entryOffsets[localIdx] + int64(EntryLengthSize) + int64(len(data))
+					seg.file.Truncate(endOffset)
+				}
 			}
+			seg.lastEntry = index
+			seg.entryOffsets = seg.entryOffsets[:localIdx+1]
 			break
 		}
 	}
