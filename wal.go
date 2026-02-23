@@ -22,7 +22,6 @@ type WAL struct {
 	status         Status
 	cursor         Cursor
 	dir            string
-	tailSFH        os.File
 	segments       []*Segment
 	currentSegment *Segment
 	cache          *littlecache.LittleCache
@@ -339,6 +338,7 @@ func (w *WAL) AddToTransaction(txID TransactionID, entry Entry) result.Result[st
 
 	if tx.IsExpired() {
 		tx.State = TransactionAborted
+		delete(w.transactions, txID) 
 		return result.Err[struct{}](ErrTransactionExpired)
 	}
 

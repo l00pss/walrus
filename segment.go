@@ -188,19 +188,18 @@ func (s *Segment) refreshMmap() error {
 		return err
 	}
 
-	if info.Size() == s.mmapSize {
-		return nil
-	}
-
+	newSize := info.Size()
+	
 	if s.mmapData != nil {
+		unix.Msync(s.mmapData, unix.MS_SYNC)
 		if err := unix.Munmap(s.mmapData); err != nil {
 			return err
 		}
 		s.mmapData = nil
 	}
 
-	if info.Size() > 0 {
-		s.mmapSize = info.Size()
+	if newSize > 0 {
+		s.mmapSize = newSize
 		s.mmapData, err = unix.Mmap(int(s.file.Fd()), 0, int(s.mmapSize), unix.PROT_READ, unix.MAP_SHARED)
 		if err != nil {
 			s.mmapSize = 0
