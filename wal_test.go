@@ -2698,3 +2698,121 @@ func TestTransactionRecovery(t *testing.T) {
 		t.Errorf("expected 0 active transactions after recovery, got %d", wal2.GetActiveTransactionCount())
 	}
 }
+
+// ==================== REGRESSION TESTS ====================
+
+func TestBufferedWriteOffsetTracking(t *testing.T) {
+	dir := tempDir(t)
+	defer cleanup(dir)
+
+	config := testConfig()
+	config.syncAfterWrite = false
+
+	wal := NewWAL(dir, config).Unwrap()
+	defer wal.Close()
+
+	for i := 0; i < 10; i++ {
+		entry := Entry{
+			Term:      uint64(i),
+			Data:      []byte("buffered test data"),
+			Timestamp: time.Now(),
+		}
+		r := wal.Append(entry)
+		if r.IsErr() {
+			t.Fatalf("Append %d failed: %v", i, r.UnwrapErr())
+		}
+	}
+
+	for i := uint64(1); i <= 10; i++ {
+		r := wal.Get(i)
+		if r.IsErr() {
+			t.Fatalf("Get(%d) failed after buffered write: %v", i, r.UnwrapErr())
+		}
+		entry := r.Unwrap()
+		if string(entry.Data) != "buffered test data" {
+			t.Errorf("Get(%d) data mismatch: got %q", i, string(entry.Data))
+		}
+		if entry.Term != uint64(i-1) {
+			t.Errorf("Get(%d) term mismatch: expected %d, got %d", i, i-1, entry.Term)
+		}
+	}
+}
+
+func TestNewWALRecoveryOnExistingDir(t *testing.T) {
+	dir := tempDir(t)
+	defer cleanup(dir)
+
+	config := testConfig()
+
+	wal1 := NewWAL(dir, config).Unwrap()
+	testData := []string{"alpha", "beta", "gamma", "delta", "epsilon"}
+	for i, s := range testData {
+		wal1.Append(Entry{
+			Term:      uint64(i),
+			Data:      []byte(s),
+			Timestamp: time.Now(),
+		})
+	}
+	wal1.Close()
+
+	wal2 := NewWAL(dir, config).Unwrap()
+	defer wal2.Close()
+
+	if wal2.GetLastIndex() != 5 {
+		t.Errorf("expected last index 5 after reopen, got %d", wal2.GetLastIndex())
+	}
+
+	for i, s := range testData {
+		r := wal2.Get(uint64(i + 1))
+		if r.IsErr() {
+			t.Fatalf("Get(%d) failed after reopen: %v", i+1, r.UnwrapErr())
+		}
+		if string(r.Unwrap().Data) != s {
+			t.Errorf("Get(%d) data mismatch: expected %q, got %q", i+1, s, string(r.Unwrap().Data))
+		}
+	}
+
+	idx := wal2.Append(Entry{
+		Data:      []byte("zeta"),
+		Timestamp: time.Now(),
+	}).Unwrap()
+
+	if idx != 6 {
+		t.Errorf("expected new entry index 6, got %d", idx)
+	}
+}
+
+func TestZeroCopyDataSafety(t *testing.T) {
+	dir := tempDir(t)
+	defer cleanup(dir)
+
+	config := testConfig()
+	config.zeroCopy = true
+
+	wal := NewWAL(dir, config).Unwrap()
+	defer wal.Close()
+
+	for i := 0; i < 5; i++ {
+		wal.Append(Entry{
+			Term:      uint64(i),
+			Data:      []byte("initial_data"),
+			Timestamp: time.Now(),
+		})
+	}
+
+	entry := wal.GetZeroCopy(3).Unwrap()
+	savedData := make([]byte, len(entry.Data))
+	copy(savedData, entry.Data)
+
+	for i := 5; i < 50; i++ {
+		wal.Append(Entry{
+			Term:      uint64(i),
+			Data:      make([]byte, 256),
+			Timestamp: time.Now(),
+		})
+	}
+
+	if !bytes.Equal(entry.Data, savedData) {
+		t.Error("zero-copy data was corrupted after subsequent writes")
+	}
+}

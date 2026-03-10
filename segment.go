@@ -28,6 +28,7 @@ type Segment struct {
 	firstEntry   uint64
 	lastEntry    uint64
 	entryOffsets []int64
+	writeOffset  int64
 	mmapData     []byte
 	mmapSize     int64
 	zeroCopyMode bool
@@ -50,7 +51,9 @@ func (s *Segment) Write(data []byte) (int, error) {
 			return 0, err
 		}
 
-		return EntryLengthSize + len(data), nil
+		written := EntryLengthSize + len(data)
+		s.writeOffset += int64(written)
+		return written, nil
 	}
 
 	n, err := s.file.Write(lengthBuf)
@@ -59,7 +62,9 @@ func (s *Segment) Write(data []byte) (int, error) {
 	}
 
 	n2, err := s.file.Write(data)
-	return n + n2, err
+	written := n + n2
+	s.writeOffset += int64(written)
+	return written, err
 }
 
 func (s *Segment) Sync() error {
@@ -189,7 +194,7 @@ func (s *Segment) refreshMmap() error {
 	}
 
 	newSize := info.Size()
-	
+
 	if s.mmapData != nil {
 		unix.Msync(s.mmapData, unix.MS_SYNC)
 		if err := unix.Munmap(s.mmapData); err != nil {
@@ -293,6 +298,7 @@ func createSegment(dir string, index uint64) (*Segment, error) {
 		firstEntry:   0,
 		lastEntry:    0,
 		entryOffsets: make([]int64, 0),
+		writeOffset:  0,
 	}, nil
 }
 
@@ -308,6 +314,12 @@ func openSegment(filePath string) (*Segment, error) {
 		return nil, err
 	}
 
+	info, err := file.Stat()
+	if err != nil {
+		file.Close()
+		return nil, err
+	}
+
 	return &Segment{
 		path:         filepath.Dir(filePath),
 		index:        index,
@@ -316,6 +328,7 @@ func openSegment(filePath string) (*Segment, error) {
 		firstEntry:   0,
 		lastEntry:    0,
 		entryOffsets: make([]int64, 0),
+		writeOffset:  info.Size(),
 	}, nil
 }
 

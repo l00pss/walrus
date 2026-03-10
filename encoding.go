@@ -190,8 +190,8 @@ func (e BinaryEncoder) DecodeZeroCopy(data []byte) result.Result[Entry] {
 		return result.Err[Entry](ErrInvalidEntry)
 	}
 
-	// Zero copy data reference (no copying!)
-	entry.Data = data[pos : pos+int(dataLen)]
+	entry.Data = make([]byte, dataLen)
+	copy(entry.Data, data[pos:pos+int(dataLen)])
 	pos += int(dataLen)
 
 	// Read Transaction ID Length

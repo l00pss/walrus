@@ -93,6 +93,10 @@ func NewWAL(dir string, config Config) result.Result[*WAL] {
 		logger:         logger,
 	}
 
+	if err := w.recover(); err != nil {
+		return result.Err[*WAL](err)
+	}
+
 	w.logger.Info("WAL initialized", "dir", dir)
 	return result.Ok(w)
 }
@@ -132,13 +136,8 @@ func (w *WAL) AppendWithContext(ctx context.Context, entry Entry) result.Result[
 		}
 	}
 
-	size, err := w.currentSegment.Size()
-	if err != nil {
-		w.logger.Error("failed to get segment size", "error", err)
-		return result.Err[uint64](err)
-	}
-	if size >= w.config.segmentSize {
-		w.logger.Debug("rotating segment", "size", size)
+	if w.currentSegment.writeOffset >= w.config.segmentSize {
+		w.logger.Debug("rotating segment", "size", w.currentSegment.writeOffset)
 		if err := w.rotateSegment(); err != nil {
 			w.logger.Error("failed to rotate segment", "error", err)
 			return result.Err[uint64](err)
@@ -154,25 +153,24 @@ func (w *WAL) AppendWithContext(ctx context.Context, entry Entry) result.Result[
 	}
 	data := seralizedEntryResult.Unwrap()
 
-	currentSize, _ := w.currentSegment.Size()
-	_, err = w.currentSegment.Write(data)
+	entryOffset := w.currentSegment.writeOffset
+	_, err := w.currentSegment.Write(data)
 	if err != nil {
 		w.logger.Error("failed to write entry", "error", err)
 		return result.Err[uint64](err)
 	}
 
-	w.currentSegment.TrackEntry(entry.Index, currentSize)
+	w.currentSegment.TrackEntry(entry.Index, entryOffset)
 
 	if w.config.syncAfterWrite {
 		if err := w.currentSegment.Sync(); err != nil {
 			w.logger.Error("failed to sync segment", "error", err)
 			return result.Err[uint64](err)
 		}
-	}
-
-	if w.config.zeroCopy && w.currentSegment.zeroCopyMode {
-		if err := w.currentSegment.refreshMmap(); err != nil {
-			w.logger.Warn("failed to refresh mmap", "error", err)
+		if w.config.zeroCopy && w.currentSegment.zeroCopyMode {
+			if err := w.currentSegment.refreshMmap(); err != nil {
+				w.logger.Warn("failed to refresh mmap", "error", err)
+			}
 		}
 	}
 
@@ -236,21 +234,24 @@ func (w *WAL) WriteBatchWithContext(ctx context.Context, entries []Entry) result
 		totalSize += len(encodedEntries[i])
 	}
 
-	currentSize, err := w.currentSegment.Size()
-	if err != nil {
-		w.logger.Error("failed to get segment size", "error", err)
-		return result.Err[[]uint64](err)
-	}
-	if currentSize+int64(totalSize) >= w.config.segmentSize {
-		w.logger.Debug("rotating segment", "currentSize", currentSize, "totalSize", totalSize)
+	if w.currentSegment.writeOffset+int64(totalSize) >= w.config.segmentSize {
+		w.logger.Debug("rotating segment", "currentSize", w.currentSegment.writeOffset, "totalSize", totalSize)
 		if err := w.rotateSegment(); err != nil {
 			w.logger.Error("failed to rotate segment", "error", err)
 			return result.Err[[]uint64](err)
 		}
 	}
 
-	startOffset, _ := w.currentSegment.Size()
+	if err := w.flushBuffer(); err != nil {
+		w.logger.Error("failed to flush buffer before batch", "error", err)
+		return result.Err[[]uint64](err)
+	}
+
+	startOffset := w.currentSegment.writeOffset
+	startEntries := len(w.currentSegment.entryOffsets)
+	startLastEntry := w.currentSegment.lastEntry
 	currentOffset := startOffset
+
 	for i, entry := range entries {
 		data := encodedEntries[i]
 
@@ -259,7 +260,7 @@ func (w *WAL) WriteBatchWithContext(ctx context.Context, entries []Entry) result
 		_, err := w.currentSegment.Write(data)
 		if err != nil {
 			w.logger.Error("failed to write entry", "index", entry.Index, "error", err)
-			w.currentSegment.file.Truncate(startOffset)
+			w.rollbackBatch(startOffset, startEntries, startLastEntry)
 			return result.Err[[]uint64](err)
 		}
 
@@ -269,14 +270,13 @@ func (w *WAL) WriteBatchWithContext(ctx context.Context, entries []Entry) result
 	if w.config.syncAfterWrite {
 		if err := w.currentSegment.Sync(); err != nil {
 			w.logger.Error("failed to sync segment", "error", err)
-			w.currentSegment.file.Truncate(startOffset)
+			w.rollbackBatch(startOffset, startEntries, startLastEntry)
 			return result.Err[[]uint64](err)
 		}
-	}
-
-	if w.config.zeroCopy && w.currentSegment.zeroCopyMode {
-		if err := w.currentSegment.refreshMmap(); err != nil {
-			w.logger.Warn("failed to refresh mmap", "error", err)
+		if w.config.zeroCopy && w.currentSegment.zeroCopyMode {
+			if err := w.currentSegment.refreshMmap(); err != nil {
+				w.logger.Warn("failed to refresh mmap", "error", err)
+			}
 		}
 	}
 
@@ -338,7 +338,7 @@ func (w *WAL) AddToTransaction(txID TransactionID, entry Entry) result.Result[st
 
 	if tx.IsExpired() {
 		tx.State = TransactionAborted
-		delete(w.transactions, txID) 
+		delete(w.transactions, txID)
 		return result.Err[struct{}](ErrTransactionExpired)
 	}
 
@@ -451,26 +451,6 @@ func (w *WAL) ensureSegment() error {
 	if w.currentSegment != nil {
 		return nil
 	}
-
-	segments, err := loadSegments(w.dir)
-	if err != nil {
-		return err
-	}
-
-	if len(segments) > 0 {
-		w.segments = segments
-		for _, seg := range w.segments {
-			seg.wal = w
-			if w.config.zeroCopy {
-				if err := seg.enableZeroCopy(); err != nil {
-					continue
-				}
-			}
-		}
-		w.currentSegment = segments[len(segments)-1]
-		return nil
-	}
-
 	return w.rotateSegment()
 }
 
@@ -524,6 +504,31 @@ func (w *WAL) cleanupOldSegments() {
 	}
 }
 
+func (w *WAL) rollbackBatch(offset int64, entryCount int, lastEntry uint64) {
+	w.currentSegment.entryOffsets = w.currentSegment.entryOffsets[:entryCount]
+	w.currentSegment.lastEntry = lastEntry
+	w.currentSegment.writeOffset = offset
+	w.bufferMu.Lock()
+	w.bufferPos = 0
+	w.bufferMu.Unlock()
+	w.currentSegment.file.Truncate(offset)
+}
+
+func (w *WAL) ensureReadable() error {
+	if err := w.flushBuffer(); err != nil {
+		return err
+	}
+	if w.config.zeroCopy && w.currentSegment != nil && w.currentSegment.zeroCopyMode {
+		size, err := w.currentSegment.Size()
+		if err == nil && size != w.currentSegment.mmapSize {
+			if err := w.currentSegment.refreshMmap(); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func (w *WAL) Get(index uint64) result.Result[Entry] {
 	if w.config.zeroCopy {
 		return w.GetZeroCopy(index)
@@ -534,6 +539,10 @@ func (w *WAL) Get(index uint64) result.Result[Entry] {
 
 	if w.state == Closed {
 		return result.Err[Entry](ErrWALClosed)
+	}
+
+	if err := w.ensureReadable(); err != nil {
+		return result.Err[Entry](err)
 	}
 
 	if index < w.cursor.FirstIndex || index > w.cursor.LastIndex {
@@ -564,6 +573,10 @@ func (w *WAL) GetZeroCopy(index uint64) result.Result[Entry] {
 
 	if w.state == Closed {
 		return result.Err[Entry](ErrWALClosed)
+	}
+
+	if err := w.ensureReadable(); err != nil {
+		return result.Err[Entry](err)
 	}
 
 	if index < w.cursor.FirstIndex || index > w.cursor.LastIndex {
@@ -609,6 +622,10 @@ func (w *WAL) GetRange(start, end uint64) result.Result[[]Entry] {
 
 	if w.state == Closed {
 		return result.Err[[]Entry](ErrWALClosed)
+	}
+
+	if err := w.ensureReadable(); err != nil {
+		return result.Err[[]Entry](err)
 	}
 
 	if start > end {
@@ -657,6 +674,10 @@ func (w *WAL) GetRangeZeroCopy(start, end uint64) result.Result[[]Entry] {
 
 	if w.state == Closed {
 		return result.Err[[]Entry](ErrWALClosed)
+	}
+
+	if err := w.ensureReadable(); err != nil {
+		return result.Err[[]Entry](err)
 	}
 
 	if start > end {
@@ -736,20 +757,7 @@ func (w *WAL) GetLastIndex() uint64 {
 }
 
 func Open(dir string, config Config) result.Result[*WAL] {
-	walResult := NewWAL(dir, config)
-	if walResult.IsErr() {
-		return walResult
-	}
-
-	w := walResult.Unwrap()
-	if err := w.recover(); err != nil {
-		return result.Err[*WAL](err)
-	}
-
-	w.cleanupUncommittedTransactions()
-
-	w.state = Ready
-	return result.Ok(w)
+	return NewWAL(dir, config)
 }
 
 func (w *WAL) recover() error {
@@ -833,6 +841,10 @@ func (w *WAL) Truncate(index uint64) result.Result[struct{}] {
 		return result.Err[struct{}](ErrIndexOutOfRange)
 	}
 
+	if err := w.flushBuffer(); err != nil {
+		return result.Err[struct{}](err)
+	}
+
 	for i := len(w.segments) - 1; i >= 0; i-- {
 		seg := w.segments[i]
 
@@ -848,11 +860,13 @@ func (w *WAL) Truncate(index uint64) result.Result[struct{}] {
 			if localIdx < uint64(len(seg.entryOffsets)-1) {
 				nextOffset := seg.entryOffsets[localIdx+1]
 				seg.file.Truncate(nextOffset)
+				seg.writeOffset = nextOffset
 			} else if localIdx == uint64(len(seg.entryOffsets)-1) {
 				data, _, err := seg.ReadAt(seg.entryOffsets[localIdx])
 				if err == nil {
 					endOffset := seg.entryOffsets[localIdx] + int64(EntryLengthSize) + int64(len(data))
 					seg.file.Truncate(endOffset)
+					seg.writeOffset = endOffset
 				}
 			}
 			seg.lastEntry = index
